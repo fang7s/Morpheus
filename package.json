@@ -1,0 +1,24 @@
+{
+  "name": "prometheus-evm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evil Panda concentrated-liquidity LP bot for Uniswap v3 on Arbitrum, Base, Ethereum, BNB Chain and Robinhood Chain",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "once": "node index.js --once",
+    "check": "node index.js --check",
+    "test": "npm run test:syntax && npm run test:unit",
+    "test:syntax": "node --check config.js && node --check logger.js && node --check index.js && node --check tools/evil-panda.js && node --check tools/uniswap-v3.js",
+    "test:unit": "node --test test/evil-panda.test.js test/chains.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.4",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

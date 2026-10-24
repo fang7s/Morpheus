@@ -1,0 +1,73 @@
+{
+  "_comment": "Copy to user-config.json. Supported chains: arbitrum, base, ethereum, bnb, robinhood. .env overrides chain/rpcUrl/DRY_RUN. Live trading requires DRY_RUN=false and I_UNDERSTAND_LIVE_TRADING=true.",
+  "_supportedChains": ["arbitrum", "base", "ethereum", "bnb", "robinhood"],
+  "chain": "arbitrum",
+  "dryRun": true,
+  "pollIntervalMs": 15000,
+
+  "panda": {
+    "enabled": true,
+    "timeframe": "5m",
+    "candles": 120,
+    "cacheSec": 60,
+    "confirmTicks": 3,
+    "rsiPeriod": 2,
+    "rsiOverbought": 80,
+    "bbPeriod": 20,
+    "bbStdDev": 2,
+    "macdFast": 12,
+    "macdSlow": 26,
+    "macdSignal": 9,
+    "confluenceMode": "any",
+    "requireMacdShift": false
+  },
+
+  "priceFeed": {
+    "bufferSize": 50,
+    "bufferMaxAgeMs": 1800000,
+    "staleSeriesMaxMs": 1800000,
+    "degradedCacheMs": 10000,
+    "geckoCooldownMs": 60000,
+    "fetchTimeoutMs": 8000
+  },
+
+  "positions": [
+    {
+      "label": "WETH/USDC 0.05% (shadow)",
+      "token0": "WETH",
+      "token1": "USDC",
+      "baseToken": "WETH",
+      "fee": 500,
+      "amountUsd": 1000,
+      "notes": "No tokenId = shadow watch only. Factory resolves the v3 pool."
+    }
+  ],
+
+  "discovery": {
+    "enabled": false,
+    "wallet": "",
+    "maxPositions": 10
+  },
+
+  "exit": {
+    "burnAfterExit": true,
+    "slippageBps": 100,
+    "deadlineSec": 1200
+  },
+
+  "risk": {
+    "stopLossPct": -50,
+    "takeProfitPct": 25
+  },
+
+  "health": {
+    "enabled": false,
+    "port": 3010
+  },
+
+  "telegram": {
+    "enabled": false,
+    "botToken": "",
+    "chatId": ""
+  }
+}

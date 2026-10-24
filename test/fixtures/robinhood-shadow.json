@@ -1,0 +1,14 @@
+{
+  "_comment": "Robinhood Chain end-to-end shadow fixture: USDG/WETH 0.01% Uniswap v3 pool.",
+  "chain": "robinhood",
+  "dryRun": true,
+  "positions": [
+    {
+      "label": "USDG/WETH 0.01% (shadow)",
+      "token0": "USDG",
+      "token1": "WETH",
+      "baseToken": "WETH",
+      "fee": 100
+    }
+  ]
+}
