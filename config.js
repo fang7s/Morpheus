@@ -428,7 +428,7 @@ function validate(config, { allowEmptyPositions = false } = {}) {
   }
   if (!config.dryRun) {
     if (!PRIVATE_KEY_RE.test(config.privateKey || "")) {
-      errors.push("live mode requires PRIVATE_KEY (0x + 64 hex chars)");
+      errors.push("live mode requires WALLET_PRIVATE_KEY (or PRIVATE_KEY): 0x + 64 hex chars");
     }
     if (!config.liveAcknowledged) {
       errors.push("live mode requires I_UNDERSTAND_LIVE_TRADING=true");
@@ -466,12 +466,20 @@ export function loadConfig(options = {}) {
   if (options.chain) merged.chain = resolveChain(options.chain).key;
 
   const envDryRun = process.env.DRY_RUN;
-  const dryRun = envDryRun != null && envDryRun !== ""
+  const envShadowMode = process.env.SHADOW_MODE;
+  const hasEnvDryRun = envDryRun != null && envDryRun !== "";
+  const hasShadowMode = envShadowMode != null && envShadowMode !== "";
+  const dryRun = hasEnvDryRun
     ? asBool(envDryRun, true)
-    : merged.dryRun !== false;
+    : hasShadowMode
+      ? asBool(envShadowMode, true)
+      : merged.dryRun !== false;
   const liveAcknowledged = asBool(process.env.I_UNDERSTAND_LIVE_TRADING, false);
 
   const warnings = [];
+  if (hasEnvDryRun && hasShadowMode && asBool(envDryRun, true) !== asBool(envShadowMode, true)) {
+    warnings.push("DRY_RUN and SHADOW_MODE disagree — DRY_RUN takes precedence.");
+  }
   let effectiveDryRun = dryRun;
   if (!dryRun && !liveAcknowledged) {
     effectiveDryRun = true;
@@ -503,7 +511,9 @@ export function loadConfig(options = {}) {
     rpcUrl: rpcUrls[0],
     rpcUrls,
     rpcByChain,
-    privateKey: String(process.env.PRIVATE_KEY || merged.privateKey || "").trim(),
+    privateKey: String(
+      process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || merged.privateKey || "",
+    ).trim(),
     dryRun: effectiveDryRun,
     liveRequested: !dryRun,
     liveAcknowledged,
@@ -559,7 +569,11 @@ export function loadConfig(options = {}) {
     },
     health: {
       enabled: asBool(process.env.HEALTH_ENABLED ?? merged.health.enabled, false),
-      port: positiveInt(process.env.HEALTH_PORT ?? merged.health.port, 3010, 1),
+      port: positiveInt(
+        process.env.PORT ?? process.env.HEALTH_PORT ?? merged.health.port,
+        3010,
+        1,
+      ),
     },
     telegram: {
       enabled: asBool(process.env.TELEGRAM_ENABLED ?? merged.telegram.enabled, false),

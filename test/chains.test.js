@@ -160,6 +160,41 @@ test("chainRuntimeConfig swaps chain metadata and its RPC route", () => {
   assert.deepEqual(bnb.rpcUrls, config.rpcByChain.bnb);
 });
 
+test("environment aliases map to wallet, shadow mode and health port", () => {
+  const privateKey = `0x${"11".repeat(32)}`;
+  withEnv({
+    CHAIN: "base",
+    DRY_RUN: null,
+    SHADOW_MODE: "false",
+    I_UNDERSTAND_LIVE_TRADING: "true",
+    WALLET_PRIVATE_KEY: privateKey,
+    PRIVATE_KEY: null,
+    PORT: "4321",
+    HEALTH_ENABLED: "true",
+    HEALTH_PORT: null,
+  }, () => {
+    const config = loadConfig({ allowEmptyPositions: true });
+    assert.equal(config.chain, "base");
+    assert.equal(config.dryRun, false);
+    assert.equal(config.liveRequested, true);
+    assert.equal(config.privateKey, privateKey);
+    assert.equal(config.health.enabled, true);
+    assert.equal(config.health.port, 4321);
+  });
+});
+
+test("DRY_RUN takes precedence over SHADOW_MODE and warns on conflict", () => {
+  withEnv({
+    DRY_RUN: "true",
+    SHADOW_MODE: "false",
+    I_UNDERSTAND_LIVE_TRADING: "false",
+  }, () => {
+    const config = loadConfig({ allowEmptyPositions: true });
+    assert.equal(config.dryRun, true);
+    assert.match(config.warnings.join(" "), /DRY_RUN and SHADOW_MODE disagree/);
+  });
+});
+
 function ADDRESS(value) {
   try {
     getAddress(value);

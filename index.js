@@ -36,11 +36,12 @@ Environment:
   ETH_RPC_URL(S) / BSC_RPC_URL(S)    per-chain RPC routes
   BASE_RPC_URL(S) / ROBINHOOD_RPC_URL(S)
   ARBITRUM_RPC_URL(S) / RPC_URL      additional RPC overrides
-  DRY_RUN                            default true
+  DRY_RUN / SHADOW_MODE              default true (DRY_RUN wins if both set)
   I_UNDERSTAND_LIVE_TRADING=true     required together with DRY_RUN=false
-  PRIVATE_KEY                        required for live trading
+  WALLET_PRIVATE_KEY                 required for live trading (PRIVATE_KEY alias)
+  PORT / HEALTH_ENABLED              local health endpoint
   POLL_INTERVAL_MS / LOG_LEVEL
-  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+  TELEGRAM_ENABLED / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 `;
 
 function parseArgs(argv) {
