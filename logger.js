@@ -1,4 +1,4 @@
-// ─── Local logger (isolated from the Solana bot) ────────────────────
+// ─── Local logger for Morpheus EVM ──────────────────────────────────
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -12,7 +12,7 @@ if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
 /**
  * Log a categorized line to stdout and to logs/agent-YYYY-MM-DD.log.
- * Category naming follows the Solana bot: include "warn"/"error" to set level,
+ * Include "warn"/"error" in the category to set the level,
  * e.g. log("panda_warn", "...") or log("startup_error", "...").
  */
 export function log(category, message) {

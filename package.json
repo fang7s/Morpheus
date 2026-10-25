@@ -1,9 +1,9 @@
 {
-  "name": "prometheus-evm",
+  "name": "morpheus",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Evil Panda concentrated-liquidity LP bot for Uniswap v3 on Arbitrum, Base, Ethereum, BNB Chain and Robinhood Chain",
+  "description": "Autonomous multi-chain concentrated-liquidity LP manager for Uniswap v3 and PancakeSwap v3 on Ethereum, BNB Chain, Base, Arbitrum and Robinhood Chain",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

@@ -1,5 +1,4 @@
 // ─── Evil Panda Strategy Module (EVM port) ─────────────────────────
-// Ported from prometheus-solana/tools/evil-panda-enhanced.js.
 // Exit engine: RSI(2) + Bollinger Band penetration + MACD shift confluence.
 // Price pipeline: GeckoTerminal/DexScreener EVM endpoints -> Uniswap v3
 // slot0 active price -> in-memory 50-sample buffer.
@@ -37,7 +36,7 @@ const spotErrorLoggedAt = new Map();
 
 /**
  * Calculate RSI (Relative Strength Index).
- * Identical math to the Solana module, including the flat-window neutral 50.
+ * Identical math to the reference module, including the flat-window neutral 50.
  */
 export function calculateRSI(prices, period = 2) {
   try {
@@ -110,7 +109,7 @@ function calculateEMA(prices, period) {
 }
 
 /**
- * Calculate MACD. Ported verbatim from the Solana module so the exit
+ * Calculate MACD. Ported verbatim from the reference module so the exit
  * behaviour matches the reference implementation.
  */
 export function calculateMACD(prices, fastPeriod = 12, slowPeriod = 26, signalPeriod = 9) {
@@ -239,7 +238,7 @@ export function checkEvilPandaExitConfluence(prices, currentPrice, options = {})
 }
 
 /**
- * 3-tick confirmation poller (in-memory port of the Solana state.js
+ * 3-tick confirmation poller (in-memory port of the reference state module
  * registerExitSignal). An exit only fires after `confirmTicks` consecutive
  * polls report the SAME signal. The streak resets when the signal clears or
  * changes.
@@ -599,7 +598,9 @@ function buildBufferSeries(key, buffer, timeframe, settings) {
  * outage. Cached per (chain, pool, timeframe, limit); never throws.
  *
  * @param {Object} params
- * @param {string} params.chain                 "arbitrum" | "base"
+ * @param {string} params.chain                 canonical chain key (cache identity)
+ * @param {string} [params.geckoNetwork]        GeckoTerminal network slug
+ * @param {string} [params.dexscreenerChain]    DexScreener chain slug
  * @param {string} params.pool_address
  * @param {string} [params.token_address]       base token for DexScreener lookup
  * @param {string} [params.timeframe]
@@ -611,6 +612,8 @@ function buildBufferSeries(key, buffer, timeframe, settings) {
  */
 export async function fetchPriceSeries({
   chain,
+  geckoNetwork,
+  dexscreenerChain,
   pool_address,
   poolAddress,
   token_address,
@@ -623,6 +626,8 @@ export async function fetchPriceSeries({
   settings = {},
 } = {}) {
   const network = String(chain || "").toLowerCase();
+  const gecko = String(geckoNetwork || network).toLowerCase();
+  const screener = String(dexscreenerChain || network).toLowerCase();
   const pool = String(pool_address || poolAddress || "").trim();
   const token = token_address || tokenAddress || null;
   const tf = String(timeframe || "5m").toLowerCase();
@@ -644,7 +649,7 @@ export async function fetchPriceSeries({
   const cooldownUntil = geckoCooldownUntil.get(key) || 0;
   if (refresh || now >= cooldownUntil) {
     try {
-      const candles = await fetchGeckoCandles(network, pool, tf, requestedLimit, feed, token);
+      const candles = await fetchGeckoCandles(gecko, pool, tf, requestedLimit, feed, token);
       const value = {
         prices: candles.map((candle) => candle.close),
         candles,
@@ -670,7 +675,7 @@ export async function fetchPriceSeries({
   let spot = null;
   try {
     spot = await fetchDexScreenerSpot({
-      chain: network,
+      chain: screener,
       poolAddress: pool,
       tokenAddress: token,
       settings: feed,
@@ -774,8 +779,3 @@ export function describeExitEngine(panda) {
     `confluence=${panda.confluenceMode}, confirmTicks=${panda.confirmTicks}`,
   ].join(" | ");
 }
-
-
-
-
-

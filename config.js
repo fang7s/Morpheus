@@ -1,6 +1,6 @@
-// ─── Prometheus EVM configuration ───────────────────────────────────
+// ─── Morpheus EVM configuration ─────────────────────────────────────
 // Loads .env + user-config.json (optional) into a validated config object.
-// Everything here is local to prometheus-evm/; no Solana config is read.
+// Everything here is local to morpheus/; no external config is read.
 
 import fs from "fs";
 import path from "path";
@@ -152,6 +152,19 @@ export const CHAINS = {
   },
 };
 
+/**
+ * .env prefixes for per-chain RPC auto-routing. Both `<PREFIX>_RPC_URL` and
+ * `<PREFIX>_RPC_URLS` (comma/space separated) are read for every chain, so all
+ * EVM endpoints can be configured simultaneously.
+ */
+export const RPC_ENV_PREFIXES = {
+  ethereum: ["ETH", "ETHEREUM"],
+  bnb: ["BSC", "BNB"],
+  base: ["BASE"],
+  robinhood: ["ROBINHOOD", "RHC"],
+  arbitrum: ["ARBITRUM", "ARB"],
+};
+
 const DEFAULTS = {
   chain: "arbitrum",
   rpcUrl: "",
@@ -165,7 +178,7 @@ const DEFAULTS = {
     cacheSec: 60,
     confirmTicks: 3,
     rsiPeriod: 2,
-    // Evil Panda overbought band is 70-80 in this bot. The reference Solana
+    // Evil Panda overbought band is 70-80 in this bot. The earlier reference
     // implementation used >90; 80 is the documented top of the requested band.
     rsiOverbought: 80,
     bbPeriod: 20,
@@ -243,6 +256,50 @@ function positiveInt(value, fallback, min = 1) {
   return Number.isFinite(parsed) && parsed >= min ? Math.floor(parsed) : fallback;
 }
 
+/** Split a comma/whitespace-separated RPC list into trimmed, non-empty URLs. */
+function splitRpcList(value) {
+  return String(value || "")
+    .split(/[,\s]+/)
+    .map((url) => url.trim())
+    .filter(Boolean);
+}
+
+/** Collect every RPC env var configured for a chain, highest priority first. */
+function envRpcsForChain(chainKey) {
+  const prefixes = RPC_ENV_PREFIXES[chainKey] || [chainKey.toUpperCase()];
+  const urls = [];
+  for (const prefix of prefixes) {
+    urls.push(...splitRpcList(process.env[`${prefix}_RPC_URL`]));
+    urls.push(...splitRpcList(process.env[`${prefix}_RPC_URLS`]));
+  }
+  return [...new Set(urls)];
+}
+
+/**
+ * Build one independent RPC route per chain. The default chain also honours the
+ * legacy global RPC_URL and user-config rpcUrl/rpcUrls overrides; other chains
+ * use their own .env vars, then the built-in public presets.
+ */
+function buildRpcByChain(defaultChain, merged) {
+  const map = {};
+  const userRpcUrls = [
+    String(merged.rpcUrl || "").trim(),
+    ...(Array.isArray(merged.rpcUrls) ? merged.rpcUrls : []),
+  ].map((url) => String(url || "").trim()).filter(Boolean);
+
+  for (const chain of Object.values(CHAINS)) {
+    const isDefault = chain.key === defaultChain.key;
+    const envUrls = envRpcsForChain(chain.key);
+    map[chain.key] = [...new Set([
+      ...(isDefault ? splitRpcList(process.env.RPC_URL) : []),
+      ...envUrls,
+      ...(isDefault ? userRpcUrls : []),
+      ...chain.rpcUrls,
+    ])];
+  }
+  return map;
+}
+
 function resolveChain(value) {
   const key = String(value || "arbitrum").trim().toLowerCase();
   const direct = CHAINS[key];
@@ -263,13 +320,35 @@ function resolveToken(chain, value) {
   return null;
 }
 
-/** Resolve a position definition into concrete token addresses. */
-function normalizePositions(positions, chain) {
+/** Resolve a position's chain from an explicit key or numeric chainId. */
+function resolvePositionChain(position, defaultChain) {
+  let chain = defaultChain;
+  const hasChain = position.chain != null && String(position.chain).trim() !== "";
+  const hasChainId = position.chainId != null && String(position.chainId).trim() !== "";
+
+  if (hasChain) chain = resolveChain(position.chain);
+  if (hasChainId) {
+    const chainId = Number(position.chainId);
+    const byId = Object.values(CHAINS).find((entry) => entry.chainId === chainId);
+    if (!byId) {
+      throw new Error(`unsupported chainId ${position.chainId}`);
+    }
+    if (hasChain && byId.key !== chain.key) {
+      throw new Error(`chain "${chain.key}" conflicts with chainId ${chainId}`);
+    }
+    chain = byId;
+  }
+  return chain;
+}
+
+/** Resolve a position definition into concrete chain + token addresses. */
+function normalizePositions(positions, defaultChain) {
   if (!Array.isArray(positions)) return [];
   return positions.map((position, index) => {
     if (!isPlainObject(position)) {
       throw new Error(`positions[${index}] must be an object`);
     }
+    const chain = resolvePositionChain(position, defaultChain);
     const token0 = resolveToken(chain, position.token0);
     const token1 = resolveToken(chain, position.token1);
     const baseToken = resolveToken(chain, position.baseToken)
@@ -294,6 +373,8 @@ function normalizePositions(positions, chain) {
 
     return {
       label: position.label || `position-${index + 1}`,
+      chain: chain.key,
+      chainId: chain.chainId,
       pool,
       tokenId,
       token0,
@@ -310,11 +391,19 @@ function validate(config, { allowEmptyPositions = false } = {}) {
   const errors = [];
   if (!ADDRESS_RE.test(config.factory)) errors.push("factory address is invalid");
   if (!ADDRESS_RE.test(config.positionManager)) errors.push("positionManager address is invalid");
-  const rpcUrls = Array.isArray(config.rpcUrls) && config.rpcUrls.length
-    ? config.rpcUrls
-    : [config.rpcUrl];
-  for (const url of rpcUrls) {
-    if (!/^https?:\/\//i.test(url || "")) errors.push(`RPC preset is not an http(s) URL: ${url}`);
+  for (const [chainKey, urls] of Object.entries(config.rpcByChain || {})) {
+    if (!Array.isArray(urls) || urls.length === 0) {
+      errors.push(`no RPC URL configured for ${chainKey}`);
+      continue;
+    }
+    for (const url of urls) {
+      if (!/^https?:\/\//i.test(url || "")) {
+        errors.push(`${chainKey} RPC is not an http(s) URL: ${url}`);
+      }
+    }
+  }
+  if (!Array.isArray(config.rpcUrls) || config.rpcUrls.length === 0) {
+    errors.push("no active RPC URL configured");
   }
   if (!/^\d+[mh]$/i.test(String(config.panda.timeframe))) {
     errors.push('panda.timeframe must look like "5m" or "1h"');
@@ -398,20 +487,10 @@ export function loadConfig(options = {}) {
     );
   }
 
-  // Explicit RPC presets: env override first, then user config, then chain
-  // defaults. Duplicates are removed while preserving priority order.
-  const envRpc = String(process.env.RPC_URL || "").trim();
-  const configuredRpcUrls = Array.isArray(merged.rpcUrls)
-    ? merged.rpcUrls.map((url) => String(url || "").trim()).filter(Boolean)
-    : [];
-  const rpcUrls = [...new Set([
-    envRpc,
-    String(merged.rpcUrl || "").trim(),
-    ...configuredRpcUrls,
-    ...(Array.isArray(chain.rpcUrls) && chain.rpcUrls.length
-      ? chain.rpcUrls
-      : [chain.rpcUrl]),
-  ].filter(Boolean))];
+  // One independent RPC route per chain. .env lists are deduped and preserve
+  // the priority order consumed by the FallbackProvider.
+  const rpcByChain = buildRpcByChain(chain, merged);
+  const rpcUrls = rpcByChain[chain.key];
 
   const config = {
     ...merged,
@@ -423,6 +502,7 @@ export function loadConfig(options = {}) {
     quoterV2: chain.quoterV2,
     rpcUrl: rpcUrls[0],
     rpcUrls,
+    rpcByChain,
     privateKey: String(process.env.PRIVATE_KEY || merged.privateKey || "").trim(),
     dryRun: effectiveDryRun,
     liveRequested: !dryRun,
@@ -502,6 +582,27 @@ export function chainInfo(chainKey) {
   return resolveChain(chainKey);
 }
 
+/**
+ * Build a chain-specific runtime config for a lazily created client. Keeps the
+ * shared runtime settings but swaps chain metadata and its .env RPC route.
+ */
+export function chainRuntimeConfig(config, chainKey) {
+  const chain = resolveChain(chainKey);
+  const configured = config.rpcByChain?.[chain.key];
+  const rpcUrls = [...new Set(
+    (Array.isArray(configured) ? configured : chain.rpcUrls).filter(Boolean),
+  )];
+  return {
+    ...config,
+    chain: chain.key,
+    chainConfig: chain,
+    chainId: chain.chainId,
+    factory: chain.factory,
+    positionManager: chain.positionManager,
+    quoterV2: chain.quoterV2,
+    rpcUrl: rpcUrls[0],
+    rpcUrls,
+  };
+}
+
 export { DEFAULTS };
-
-

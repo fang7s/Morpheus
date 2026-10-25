@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to user-config.json. Supported chains: arbitrum, base, ethereum, bnb, robinhood. .env overrides chain/rpcUrl/DRY_RUN. Live trading requires DRY_RUN=false and I_UNDERSTAND_LIVE_TRADING=true.",
+  "_comment": "Copy to user-config.json. Each position may set 'chain' or 'chainId' to route it to that chain's .env RPCs; otherwise it inherits CHAIN. Live trading requires DRY_RUN=false and I_UNDERSTAND_LIVE_TRADING=true.",
   "_supportedChains": ["arbitrum", "base", "ethereum", "bnb", "robinhood"],
   "chain": "arbitrum",
   "dryRun": true,
@@ -34,6 +34,7 @@
   "positions": [
     {
       "label": "WETH/USDC 0.05% (shadow)",
+      "chain": "arbitrum",
       "token0": "WETH",
       "token1": "USDC",
       "baseToken": "WETH",

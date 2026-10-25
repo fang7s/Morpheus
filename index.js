@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// ─── Prometheus EVM entry point ─────────────────────────────────────
+// ─── Morpheus EVM entry point ───────────────────────────────────────
 // Evil Panda concentrated-liquidity exit bot for Uniswap v3 on Arbitrum, Base,
 // Ethereum Mainnet, BNB Smart Chain and Robinhood Chain.
 // Shadow/dry-run mode is ON by default and performs no writes.
 
 import express from "express";
-import { loadConfig } from "./config.js";
+import { chainInfo, chainRuntimeConfig, loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { UniswapV3 } from "./tools/uniswap-v3.js";
 import {
@@ -17,7 +17,7 @@ import {
   getPriceSeriesCacheStats,
 } from "./tools/evil-panda.js";
 
-const HELP = `Prometheus EVM — Uniswap v3 Evil Panda LP bot
+const HELP = `Morpheus EVM — Uniswap v3 Evil Panda LP bot
 
 Usage:
   node index.js [options]
@@ -32,10 +32,14 @@ Options:
   --help              Show this help
 
 Environment:
+  CHAIN                              default chain for unqualified positions
+  ETH_RPC_URL(S) / BSC_RPC_URL(S)    per-chain RPC routes
+  BASE_RPC_URL(S) / ROBINHOOD_RPC_URL(S)
+  ARBITRUM_RPC_URL(S) / RPC_URL      additional RPC overrides
   DRY_RUN                            default true
   I_UNDERSTAND_LIVE_TRADING=true     required together with DRY_RUN=false
   PRIVATE_KEY                        required for live trading
-  RPC_URL / CHAIN / POLL_INTERVAL_MS / LOG_LEVEL
+  POLL_INTERVAL_MS / LOG_LEVEL
   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 `;
 
@@ -83,11 +87,40 @@ function shortAddress(address) {
   return value.length > 12 ? `${value.slice(0, 6)}…${value.slice(-4)}` : value;
 }
 
+/**
+ * Lazily create one UniswapV3 client per chain. Each client reads its own
+ * .env-configured RPC route, so positions on different chains never share a
+ * provider or fallback array.
+ */
+function createClientRouter(config) {
+  const clients = new Map();
+  return {
+    get(chainKey) {
+      const chain = chainInfo(chainKey);
+      if (!clients.has(chain.key)) {
+        const chainConfig = chainRuntimeConfig(config, chain.key);
+        clients.set(chain.key, new UniswapV3(chainConfig));
+        log(
+          "startup",
+          `RPC route ${chain.key}: ${chainConfig.rpcUrls.length} endpoint(s), `
+          + `primary ${chainConfig.rpcUrl}`,
+        );
+      }
+      return clients.get(chain.key);
+    },
+    destroy() {
+      for (const client of clients.values()) client.destroy();
+      clients.clear();
+    },
+  };
+}
+
 function printBanner(config) {
   log("startup", "────────────────────────────────────────────────────────");
-  log("startup", "Prometheus EVM — Uniswap v3 Evil Panda LP bot");
+  log("startup", "Morpheus EVM — Uniswap v3 Evil Panda LP bot");
   log("startup", `Chain: ${config.chainConfig.name} (${config.chainId})`);
   log("startup", `RPC: ${config.rpcUrl} (${config.rpcUrls.length} preset${config.rpcUrls.length === 1 ? "" : "s"})`);
+  log("startup", `RPC routes: ${Object.keys(config.rpcByChain || {}).join(", ")}`);
   log("startup", `Mode: ${config.dryRun ? "SHADOW / DRY-RUN (no writes)" : "LIVE TRADING"}`);
   log("startup", `Factory: ${config.factory}`);
   log("startup", `PositionManager: ${config.positionManager}`);
@@ -105,6 +138,10 @@ function printCheck(config) {
     `mode=${config.dryRun ? "shadow" : "LIVE"}`,
     `rpc=${config.rpcUrl}`,
     `rpcPresets=${config.rpcUrls.join(", ")}`,
+    `chains=${Object.keys(config.rpcByChain || {}).join(",")}`,
+    ...Object.entries(config.rpcByChain || {}).map(
+      ([chainKey, urls]) => `rpc.${chainKey}=${urls[0]} (${urls.length})`,
+    ),
     `positionManager=${config.positionManager}`,
     `factory=${config.factory}`,
     `panda=${describeExitEngine(config.panda)}`,
@@ -127,14 +164,15 @@ function printCheck(config) {
 }
 
 function positionKey(position) {
-  return `${position.pool.toLowerCase()}:${position.tokenId || position.label}`;
+  return `${position.chain || "unknown"}:${position.pool.toLowerCase()}:`
+    + `${position.tokenId || position.label}`;
 }
 
 /**
  * Resolve configured positions and optionally discover wallet positions.
  * A definition with only token0/token1/fee resolves its pool via Factory.
  */
-async function resolvePositions(config, client) {
+async function resolvePositions(config, router) {
   const resolved = [];
   const seen = new Set();
 
@@ -147,6 +185,8 @@ async function resolvePositions(config, client) {
 
   for (const def of config.positions) {
     try {
+      const chainKey = def.chain || config.chain;
+      const client = router.get(chainKey);
       let pool = def.pool;
       let token0 = def.token0;
       let token1 = def.token1;
@@ -171,6 +211,7 @@ async function resolvePositions(config, client) {
       const baseToken = def.baseToken || await client.resolveBaseToken(pool, null);
       add({
         ...def,
+        chain: chainKey,
         pool,
         token0: token0 || state.token0,
         token1: token1 || state.token1,
@@ -182,7 +223,8 @@ async function resolvePositions(config, client) {
       });
       log(
         "startup",
-        `Watching ${def.label}: ${state.token0Symbol || shortAddress(state.token0)}/`
+        `Watching ${def.label} on ${chainKey}: `
+        + `${state.token0Symbol || shortAddress(state.token0)}/`
         + `${state.token1Symbol || shortAddress(state.token1)} fee=${state.fee} `
         + `pool=${shortAddress(pool)}${def.tokenId ? ` tokenId=${def.tokenId}` : " (shadow watch)"}`,
       );
@@ -192,18 +234,21 @@ async function resolvePositions(config, client) {
   }
 
   if (config.discovery.enabled) {
-    const owner = client.walletAddress || config.discovery.wallet;
+    const discoveryClient = router.get(config.chain);
+    const owner = discoveryClient.walletAddress || config.discovery.wallet;
     if (!owner) {
       log("panda_warn", "Discovery is enabled but no wallet address is available.");
     } else {
       try {
-        const walletPositions = await client.getWalletPositions(owner, {
+        const walletPositions = await discoveryClient.getWalletPositions(owner, {
           limit: config.discovery.maxPositions,
         });
         for (const onchain of walletPositions) {
-          const baseToken = await client.resolveBaseToken(onchain.pool, null);
+          const baseToken = await discoveryClient.resolveBaseToken(onchain.pool, null);
           add({
             label: `wallet-${onchain.tokenId}`,
+            chain: config.chain,
+            chainId: config.chainId,
             pool: onchain.pool,
             tokenId: onchain.tokenId,
             token0: onchain.token0,
@@ -227,9 +272,12 @@ async function resolvePositions(config, client) {
 
 /** Fetch the multi-layer price series and run the Evil Panda confluence. */
 async function evaluatePosition(config, client, position) {
+  const chain = chainInfo(position.chain);
   const baseToken = position.baseToken || await client.resolveBaseToken(position.pool, null);
   const series = await fetchPriceSeries({
-    chain: config.chain,
+    chain: chain.key,
+    geckoNetwork: chain.geckoNetwork,
+    dexscreenerChain: chain.dexscreenerChain,
     pool_address: position.pool,
     token_address: baseToken,
     timeframe: config.panda.timeframe,
@@ -285,10 +333,12 @@ async function handleExit({ config, client, position, evaluation, signalReason }
       ? "DRY-RUN: no transaction sent"
       : "no tokenId (shadow watch): no transaction sent";
     log("panda_exit", `[SHADOW] ${base} | ${detail}`);
-    await notifyTelegram(config, `Prometheus EVM SHADOW exit\n${base}\n${detail}`);
+    await notifyTelegram(config, `Morpheus EVM SHADOW exit\n${base}\n${detail}`);
     return {
       shadow: true,
       reason: signalReason,
+      chain: position.chain,
+      chainId: position.chainId,
       pool: position.pool,
       tokenId: position.tokenId,
       price: evaluation.series.currentPrice,
@@ -301,14 +351,14 @@ async function handleExit({ config, client, position, evaluation, signalReason }
   const result = await client.closePosition(position.tokenId, config.exit);
   await notifyTelegram(
     config,
-    `Prometheus EVM LIVE exit\n${base}\ntx=${result.txHashes.join(", ")}`,
+    `Morpheus EVM LIVE exit\n${base}\ntx=${result.txHashes.join(", ")}`,
   );
   return result;
 }
 
 /** One evaluation pass over all resolved positions. */
 async function runCycle(ctx) {
-  const { config, client, positions, confirmation, runtime } = ctx;
+  const { config, router, positions, confirmation, runtime } = ctx;
   if (ctx.busy) return;
   ctx.busy = true;
   runtime.polls += 1;
@@ -325,6 +375,7 @@ async function runCycle(ctx) {
       if (tracked.exited) continue;
 
       try {
+        const client = router.get(position.chain);
         const evaluation = await evaluatePosition(config, client, position);
         const { series, result } = evaluation;
         const sampleCount = series.prices?.length || 0;
@@ -412,6 +463,10 @@ function startHealthServer(ctx) {
       status: "ok",
       chain: config.chain,
       chainId: config.chainId,
+      chains: [...new Set(positions.map((position) => position.chain))],
+      rpcRoutes: Object.fromEntries(
+        Object.entries(config.rpcByChain || {}).map(([key, urls]) => [key, urls.length]),
+      ),
       mode: config.dryRun ? "shadow" : "live",
       startedAt: runtime.startedAt,
       lastCycleAt: runtime.lastCycleAt,
@@ -427,6 +482,8 @@ function startHealthServer(ctx) {
   app.get("/positions", (_req, res) => {
     res.json(positions.map((position) => ({
       label: position.label,
+      chain: position.chain,
+      chainId: position.chainId,
       pool: position.pool,
       tokenId: position.tokenId,
       token0: position.token0,
@@ -473,22 +530,22 @@ async function main() {
     log("startup", "In-memory price caches cleared.");
   }
 
-  const client = new UniswapV3(config);
-  const positions = await resolvePositions(config, client);
+  const router = createClientRouter(config);
+  const positions = await resolvePositions(config, router);
 
   if (positions.length === 0) {
     log(
       "startup_warn",
       "No positions resolved. Add positions to user-config.json, or enable discovery with a wallet address.",
     );
-    client.destroy();
+    router.destroy();
     process.exitCode = 1;
     return;
   }
 
   const ctx = {
     config,
-    client,
+    router,
     positions,
     confirmation: createExitConfirmation(config.panda.confirmTicks),
     busy: false,
@@ -516,7 +573,7 @@ async function main() {
       await new Promise((resolve) => server.close(resolve));
       log("shutdown", "Health server closed.");
     }
-    client.destroy();
+    router.destroy();
     log("shutdown", "Stopped.");
     if (exitProcess) process.exit(0);
   }
@@ -554,6 +611,3 @@ main().catch((error) => {
   log("startup_error", error?.stack || error?.message || String(error));
   process.exitCode = 1;
 });
-
-
-
