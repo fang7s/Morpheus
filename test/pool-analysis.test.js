@@ -39,10 +39,10 @@ function dexPair(overrides = {}) {
   };
 }
 
-function goPlusPayload() {
+function goPlusPayload(tokenAddress = TOKEN) {
   return {
     result: {
-      [TOKEN.toLowerCase()]: {
+      [tokenAddress.toLowerCase()]: {
         holder_count: "10000",
         creator_percent: "0.01",
         is_honeypot: "0",
@@ -153,12 +153,16 @@ test("resolves a pool address through GeckoTerminal fallback", async () => {
       dex: { data: { id: "uniswap_v3" } },
     },
   };
+  const goplusRequests = [];
   const fetchImpl = async (url) => {
     if (url.includes("dexscreener")) return response({ pairs: [] });
     if (url.includes("geckoterminal") && url.includes("search/pools")) {
       return response({ data: [geckoPool] });
     }
-    if (url.includes("goplus")) return response({ result: {} });
+    if (url.includes("goplus")) {
+      goplusRequests.push(url);
+      return response({ result: {} });
+    }
     return response({ data: [] });
   };
 
@@ -169,14 +173,25 @@ test("resolves a pool address through GeckoTerminal fallback", async () => {
   });
 
   assert.equal(analysis.chain, "polygon");
+  assert.equal(analysis.addressType, "pool");
   assert.equal(analysis.pools.length, 1);
+  assert.equal(analysis.pools[0].pool, poolAddress);
+  assert.equal(analysis.poolTokens.length, 2);
+  assert.equal(analysis.tokenSecurities.length, 2);
+  assert.equal(analysis.securityVerified, false);
+  assert.equal(goplusRequests.length, 2);
+  assert.ok(goplusRequests.some((url) => url.toLowerCase().includes(USDC.toLowerCase())));
+  assert.ok(goplusRequests.some((url) => url.toLowerCase().includes(WETH.toLowerCase())));
   assert.equal(analysis.primary.feePercent, 0.01);
   assert.equal(analysis.token.symbol, "WETH");
   assert.equal(analysis.priceUsd, 2350);
   assert.equal(analysis.narrative.volumeTvlPct, 300);
   const text = formatPoolAnalysis(analysis);
+  assert.match(text, /Type: <b>POOL<\/b>/);
   assert.match(text, /USDC\/WETH/);
   assert.match(text, /geckoterminal\.com\/polygon_pos\/pools/);
+  assert.match(text, /Pool token checks:/);
+  assert.match(text, /Risk: <b>UNVERIFIED \(MEDIUM\)<\/b>/);
   assert.match(text, /Narrative/);
 });
 
@@ -203,6 +218,127 @@ test("renders helpful errors for invalid or unknown addresses", async () => {
     enableRpcFallback: false,
   });
   assert.match(formatPoolAnalysis(noPools), /No supported EVM chain/);
+});
+
+test("resolves a token address to every pool where it is token0 or token1", async () => {
+  const token = "0x7777777777777777777777777777777777777777";
+  const other = "0x8888888888888888888888888888888888888888";
+  const poolA = "0xaaaa000000000000000000000000000000000001";
+  const poolB = "0xbbbb000000000000000000000000000000000002";
+  const decoy = "0xcccc000000000000000000000000000000000003";
+  const goplusRequests = [];
+
+  const fetchImpl = async (url) => {
+    if (url.includes("dexscreener") && url.includes("/tokens/")) {
+      return response({
+        pairs: [
+          dexPair({
+            pairAddress: poolA,
+            baseToken: { address: token, name: "Morpheus", symbol: "MORPH" },
+            quoteToken: { address: USDC, name: "USD Coin", symbol: "USDC" },
+          }),
+          dexPair({
+            pairAddress: poolB,
+            baseToken: { address: WETH, name: "Wrapped Ether", symbol: "WETH" },
+            quoteToken: { address: token, name: "Morpheus", symbol: "MORPH" },
+          }),
+          dexPair({
+            pairAddress: decoy,
+            baseToken: { address: other, name: "Other", symbol: "OTH" },
+            quoteToken: { address: USDC, name: "USD Coin", symbol: "USDC" },
+          }),
+        ],
+      });
+    }
+    if (url.includes("goplus")) {
+      goplusRequests.push(url);
+      return response(goPlusPayload(token));
+    }
+    return response({ pairs: [] });
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: token,
+    fetchImpl,
+    enableRpcFallback: false,
+  });
+
+  assert.equal(analysis.addressType, "token");
+  assert.equal(analysis.address, token);
+  assert.equal(analysis.pools.length, 2, "decoy pool must be filtered out");
+  for (const pool of analysis.pools) {
+    assert.equal(isEvmAddress(pool.pool), true, `pool address ${pool.pool}`);
+    assert.equal(pool.token0.length, 42);
+    assert.equal(pool.token1.length, 42);
+    assert.ok(
+      [pool.token0, pool.token1].some((address) => address.toLowerCase() === token),
+      "resolved pool must contain the token as token0 or token1",
+    );
+  }
+  assert.ok(
+    analysis.pools.some((pool) => pool.pool === poolA)
+      && analysis.pools.some((pool) => pool.pool === poolB),
+    "both base and quote side pools must resolve",
+  );
+
+  // GoPlus must be queried with the TOKEN address, never a pool address.
+  assert.equal(goplusRequests.length, 1);
+  assert.match(goplusRequests[0], new RegExp(token.toLowerCase()));
+  assert.ok(!goplusRequests[0].toLowerCase().includes(poolA.slice(2, 10)));
+
+  const text = formatPoolAnalysis(analysis);
+  assert.match(text, /Type: <b>TOKEN<\/b>/);
+  assert.match(text, /2 found/);
+});
+
+test("normalizes bytes32 pool ids, parses fee tiers and shows only top 3 pools", async () => {
+  const token = "0x9999999999999999999999999999999999999999";
+  const addresses = [
+    "0x1000000000000000000000000000000000000001",
+    "0x2000000000000000000000000000000000000002",
+    "0x3000000000000000000000000000000000000003",
+    "0x4000000000000000000000000000000000000004",
+  ];
+  const fetchImpl = async (url) => {
+    if (url.includes("dexscreener") && url.includes("/tokens/")) {
+      return response({
+        pairs: addresses.map((address, index) => dexPair({
+          // First pool id is a left-padded ABI word (topic style).
+          pairAddress: index === 0 ? `0x${"0".repeat(24)}${address.slice(2)}` : address,
+          feeTier: [100, 500, 3000, 10000][index],
+          liquidity: { usd: 1_000_000 - index * 100_000 },
+          baseToken: { address: token, name: "Morpheus", symbol: "MORPH" },
+        })),
+      });
+    }
+    if (url.includes("goplus")) return response({ result: {} });
+    return response({ pairs: [] });
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: token,
+    fetchImpl,
+    enableRpcFallback: false,
+  });
+
+  assert.deepEqual(
+    analysis.pools.map((pool) => pool.feePercent),
+    [0.01, 0.05, 0.3, 1],
+  );
+  assert.equal(analysis.pools[0].pool, addresses[0]);
+  assert.ok(analysis.pools.every((pool) => isEvmAddress(pool.pool)));
+
+  const text = formatPoolAnalysis(analysis);
+  assert.match(text, /fee 0\.01%/);
+  assert.match(text, /…\+1 minor pools/);
+  assert.match(text, /Risk: <b>UNVERIFIED \(MEDIUM\)<\/b>/);
+  assert.match(text, /⚠️ Token safety metadata unverified/);
+  for (const match of text.matchAll(/<code>(0x[0-9a-fA-F]+)<\/code>/g)) {
+    if (match[1].length === 42) continue;
+    // Short values are allowed only for holder abbreviations in this report.
+    assert.equal(match[1].startsWith("0x") && match[1].length < 42, true);
+  }
+  assert.ok(!/<code>0x[0-9a-fA-F]{42,}<\/code>/.test(text));
 });
 
 test("narrative flags honeypots and thin liquidity as high risk", () => {

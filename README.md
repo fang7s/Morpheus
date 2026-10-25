@@ -82,9 +82,18 @@ configured chat ID.
 | `/start`, `/help` | Command list and bot status |
 | `/wallet` | Wallet address, native ETH/BNB balances, per-chain RPC status, discovered LP count |
 | `/positions` | Open LP positions, chain, pool/ticks, entry and active price; refreshes wallet discovery |
-| `/pool <address>` | Multi-chain token/pool analysis: DEX pools, TVL, volume, prices, holders and risk narrative |
+| `/pool <address>` | Multi-chain token/pool analysis: auto-detects TOKEN vs POOL, resolves all pools, top-3 TVL detail, GoPlus safety and risk narrative |
 | `/history` | Last 10 closed positions with timestamp and close reason |
 | `/pnl` | Closed-trade count and estimated realized PnL |
+
+`/pool` auto-detects whether the input is a TOKEN or a POOL contract (via
+DexScreener/GeckoTerminal and on-chain `token0()`/`token1()`/`decimals()`
+reads). Token inputs query GoPlus with the token address and aggregate every
+pool where the token is `token0` or `token1`; pool inputs resolve both
+underlying tokens and fetch security for each. Pools are normalized to strict
+20-byte EVM addresses, fees are read from `fee()` when APIs omit them, and only
+the top 3 pools by TVL are detailed. Missing GoPlus metadata is reported as
+`UNVERIFIED (MEDIUM)`, never `LOW`.
 
 `/pool` discovers tokens and pools on Arbitrum, Base, BNB Chain, Ethereum,
 Polygon, Avalanche, Optimism and Robinhood Chain through DexScreener,

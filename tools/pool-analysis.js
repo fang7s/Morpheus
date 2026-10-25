@@ -9,7 +9,12 @@ const DEXSCREENER_API = "https://api.dexscreener.com/latest/dex";
 const GECKO_API = "https://api.geckoterminal.com/api/v2";
 const GOPLUS_API = "https://api.gopluslabs.io/api/v1";
 const FEE_SELECTOR = "0xddca3f43";
-const MAX_POOLS = 6;
+const TOKEN0_SELECTOR = "0x0dfe1681";
+const TOKEN1_SELECTOR = "0xd21220a7";
+const DECIMALS_SELECTOR = "0x313ce567";
+const SYMBOL_SELECTOR = "0x95d89b41";
+const MAX_POOLS = 10;
+const DETAILED_POOLS = 3;
 
 /** Supported analysis networks, including chains without a configured bot RPC. */
 export const POOL_CHAINS = {
@@ -114,6 +119,57 @@ export function isEvmAddress(value) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(value || "").trim());
 }
 
+/**
+ * Normalize any EVM address-like value into a strict 20-byte contract address.
+ * Accepts plain 20-byte addresses, 32-byte ABI words/topics (left padded) and
+ * bytes32 pool ids, returning `0x` + 40 hex characters or null.
+ */
+export function normalizeEvmAddress(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const hex = raw.replace(/^0x/i, "");
+  if (!/^[0-9a-fA-F]+$/.test(hex)) return null;
+  if (hex.length === 40) return `0x${hex}`;
+  if (hex.length === 64) {
+    const head = hex.slice(0, 24);
+    // ABI-encoded addresses / topics are left padded with zeros.
+    const body = /^0+$/.test(head) ? hex.slice(24) : hex.slice(-40);
+    return `0x${body}`;
+  }
+  if (hex.length > 40) return `0x${hex.slice(-40)}`;
+  return null;
+}
+
+function sameAddress(a, b) {
+  const left = normalizeEvmAddress(a);
+  const right = normalizeEvmAddress(b);
+  return Boolean(left && right && left.toLowerCase() === right.toLowerCase());
+}
+
+function sortTokenAddresses(a, b) {
+  const left = normalizeEvmAddress(a);
+  const right = normalizeEvmAddress(b);
+  if (!left || !right) return [left || null, right || null];
+  return left.toLowerCase() <= right.toLowerCase() ? [left, right] : [right, left];
+}
+
+function decodeAddressWord(data) {
+  const hex = String(data || "").replace(/^0x/i, "");
+  if (hex.length !== 64) return null;
+  return normalizeEvmAddress(hex);
+}
+
+function decodeUint(data) {
+  const hex = String(data || "").replace(/^0x/i, "");
+  if (!hex || !/^[0-9a-fA-F]+$/.test(hex)) return null;
+  try {
+    return BigInt(`0x${hex}`);
+  } catch {
+    return null;
+  }
+}
+
+
 function num(value) {
   if (value == null || value === "") return null;
   const number = Number(value);
@@ -156,15 +212,43 @@ async function fetchJson(url, fetchImpl, timeoutMs = 8_000) {
 }
 
 function parseFeePercent(value) {
-  const text = String(value || "");
+  const text = String(value ?? "");
   const match = text.match(/(\d+(?:\.\d+)?)\s*%/);
   return match ? Number(match[1]) : null;
 }
 
+/**
+ * Convert an API fee field into a human percentage.
+ * Uniswap-style fee tiers are hundredths of a basis point:
+ * 100 -> 0.01%, 500 -> 0.05%, 3000 -> 0.3%, 10000 -> 1%.
+ * Fractions (0.003) and pre-formatted percentages (0.3) are also accepted.
+ */
 function feeFromRaw(rawFee) {
+  if (rawFee == null || rawFee === "") return null;
+  if (typeof rawFee === "string") {
+    const parsed = parseFeePercent(rawFee);
+    if (parsed != null) return parsed;
+    if (!/^-?\d+(?:\.\d+)?$/.test(rawFee.trim())) return null;
+  }
   const fee = Number(rawFee);
-  if (!Number.isFinite(fee) || fee < 0 || fee > 1_000_000) return null;
-  return fee / 10_000;
+  if (!Number.isFinite(fee) || fee < 0) return null;
+  if (fee === 0) return 0;
+  if (Number.isInteger(fee)) {
+    return fee > 1_000_000 ? null : Number((fee / 10_000).toFixed(6));
+  }
+  if (fee < 0.01) return Number((fee * 100).toFixed(6));
+  if (fee > 1_000_000) return null;
+  return Number(fee.toFixed(6));
+}
+
+/** First parseable fee candidate (string percent, raw tier or fraction). */
+function resolveFeePercent(...candidates) {
+  for (const candidate of candidates) {
+    if (candidate == null || candidate === "") continue;
+    const fee = feeFromRaw(candidate);
+    if (fee != null) return fee;
+  }
+  return null;
 }
 
 function dexName(dexId) {
@@ -181,10 +265,21 @@ function dexName(dexId) {
 
 function normalizeDexPair(pair) {
   const chainKey = CHAIN_BY_DEX[String(pair?.chainId || "").toLowerCase()];
-  if (!chainKey || !pair?.pairAddress) return null;
+  if (!chainKey) return null;
+
+  const pool = normalizeEvmAddress(pair.pairAddress)
+    || normalizeEvmAddress(pair.pairId)
+    || normalizeEvmAddress(pair.poolAddress)
+    || normalizeEvmAddress(pair.address);
+  if (!pool) return null;
+
+  const baseAddress = normalizeEvmAddress(pair.baseToken?.address);
+  const quoteAddress = normalizeEvmAddress(pair.quoteToken?.address);
+  const [token0, token1] = sortTokenAddresses(baseAddress, quoteAddress);
   const buys = num(pair.txns?.h24?.buys) || 0;
   const sells = num(pair.txns?.h24?.sells) || 0;
-  const rawFee = num(pair.feeTier ?? pair.fee);
+  const rawFee = pair.feeTier ?? pair.fee;
+  const chain = POOL_CHAINS[chainKey];
 
   return {
     source: "dexscreener",
@@ -192,8 +287,10 @@ function normalizeDexPair(pair) {
     dex: dexName(pair.dexId),
     dexId: String(pair.dexId || ""),
     pair: `${pair.baseToken?.symbol || "?"}/${pair.quoteToken?.symbol || "?"}`,
-    pool: String(pair.pairAddress),
-    feePercent: rawFee != null ? feeFromRaw(rawFee) : parseFeePercent(pair.name),
+    pool,
+    poolId: String(pair.pairAddress || ""),
+    feePercent: resolveFeePercent(rawFee, pair.feeTier, pair.fee, pair.name),
+    feeRaw: rawFee,
     tvl: num(pair.liquidity?.usd),
     volume24h: num(pair.volume?.h24),
     priceUsd: num(pair.priceUsd),
@@ -208,25 +305,34 @@ function normalizeDexPair(pair) {
     sells,
     txns24h: buys + sells,
     createdAt: num(pair.pairCreatedAt),
+    token0,
+    token1,
     base: {
-      address: pair.baseToken?.address || null,
+      address: baseAddress,
       symbol: pair.baseToken?.symbol || null,
       name: pair.baseToken?.name || null,
     },
     quote: {
-      address: pair.quoteToken?.address || null,
+      address: quoteAddress,
       symbol: pair.quoteToken?.symbol || null,
       name: pair.quoteToken?.name || null,
     },
     labels: Array.isArray(pair.labels) ? pair.labels : [],
-    chartUrl: pair.url || null,
+    chartUrl: pair.url || `https://dexscreener.com/${chain.dexScreener}/${pool}`,
   };
 }
 
 function pairMatches(pair, address) {
-  const target = address.toLowerCase();
-  return [pair.pairAddress, pair.baseToken?.address, pair.quoteToken?.address]
-    .some((value) => String(value || "").toLowerCase() === target);
+  const target = normalizeEvmAddress(address);
+  if (!target) return false;
+  return [
+    pair.pairAddress,
+    pair.pairId,
+    pair.poolAddress,
+    pair.address,
+    pair.baseToken?.address,
+    pair.quoteToken?.address,
+  ].some((value) => sameAddress(value, target));
 }
 
 async function fetchDexPools(address, fetchImpl, timeoutMs) {
@@ -247,12 +353,14 @@ async function fetchDexPools(address, fetchImpl, timeoutMs) {
     }
   }
 
+  return dedupePools(pairs.map(normalizeDexPair).filter(Boolean));
+}
+
+function dedupePools(pools) {
   const seen = new Set();
-  return pairs
-    .map(normalizeDexPair)
-    .filter(Boolean)
+  return pools
     .filter((pool) => {
-      const key = `${pool.chain}:${pool.pool.toLowerCase()}`;
+      const key = `${pool.chain}:${String(pool.pool).toLowerCase()}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -288,8 +396,13 @@ function normalizeGeckoPool(item) {
   const quoteSymbol = nameParts[1]?.trim().split(/\s+/)[0] || null;
   const buys = num(attrs.transactions?.h24?.buys) || 0;
   const sells = num(attrs.transactions?.h24?.sells) || 0;
-  const poolAddress = attrs.address || geckoIdPart(item.id);
-  if (!poolAddress) return null;
+  const pool = normalizeEvmAddress(attrs.address)
+    || normalizeEvmAddress(geckoIdPart(item.id));
+  if (!pool) return null;
+
+  const baseAddress = normalizeEvmAddress(geckoIdPart(item.relationships?.base_token?.data?.id));
+  const quoteAddress = normalizeEvmAddress(geckoIdPart(item.relationships?.quote_token?.data?.id));
+  const [token0, token1] = sortTokenAddresses(baseAddress, quoteAddress);
 
   return {
     source: "geckoterminal",
@@ -297,8 +410,15 @@ function normalizeGeckoPool(item) {
     dex: dexName(item.relationships?.dex?.data?.id),
     dexId: String(item.relationships?.dex?.data?.id || ""),
     pair: `${baseSymbol || "?"}/${quoteSymbol || "?"}`,
-    pool: poolAddress,
-    feePercent: parseFeePercent(attrs.name),
+    pool,
+    poolId: String(attrs.address || geckoIdPart(item.id) || ""),
+    feePercent: resolveFeePercent(
+      attrs.fee_tier,
+      attrs.fee,
+      attrs.pool_fee_percentage,
+      attrs.name,
+    ),
+    feeRaw: attrs.fee_tier ?? attrs.fee ?? null,
     tvl: num(attrs.reserve_in_usd),
     volume24h: num(attrs.volume_usd?.h24),
     priceUsd: num(attrs.base_token_price_usd),
@@ -311,18 +431,20 @@ function normalizeGeckoPool(item) {
     sells,
     txns24h: buys + sells,
     createdAt: attrs.pool_created_at ? Date.parse(attrs.pool_created_at) : null,
+    token0,
+    token1,
     base: {
-      address: geckoIdPart(item.relationships?.base_token?.data?.id) || null,
+      address: baseAddress,
       symbol: baseSymbol,
       name: null,
     },
     quote: {
-      address: geckoIdPart(item.relationships?.quote_token?.data?.id) || null,
+      address: quoteAddress,
       symbol: quoteSymbol,
       name: null,
     },
     labels: [],
-    chartUrl: `https://www.geckoterminal.com/${POOL_CHAINS[chainKey].gecko}/pools/${poolAddress}`,
+    chartUrl: `https://www.geckoterminal.com/${POOL_CHAINS[chainKey].gecko}/pools/${pool}`,
   };
 }
 
@@ -336,11 +458,13 @@ async function fetchGeckoPools(address, fetchImpl, timeoutMs) {
     );
     const items = Array.isArray(payload?.data) ? payload.data : [];
     for (const item of items) {
-      const target = address.toLowerCase();
-      const base = geckoIdPart(item.relationships?.base_token?.data?.id).toLowerCase();
-      const quote = geckoIdPart(item.relationships?.quote_token?.data?.id).toLowerCase();
-      const poolAddress = String(item.attributes?.address || "").toLowerCase();
-      if (target !== poolAddress && target !== base && target !== quote) continue;
+      const target = normalizeEvmAddress(address);
+      const base = normalizeEvmAddress(geckoIdPart(item.relationships?.base_token?.data?.id));
+      const quote = normalizeEvmAddress(geckoIdPart(item.relationships?.quote_token?.data?.id));
+      const poolAddress = normalizeEvmAddress(item.attributes?.address);
+      if (!sameAddress(target, poolAddress)
+        && !sameAddress(target, base)
+        && !sameAddress(target, quote)) continue;
       const pool = normalizeGeckoPool(item);
       if (pool) pools.push(pool);
     }
@@ -357,7 +481,7 @@ async function fetchGeckoPools(address, fetchImpl, timeoutMs) {
           timeoutMs,
         );
         const pool = normalizeGeckoPool(payload?.data);
-        return pool && pool.pool.toLowerCase() === address.toLowerCase() ? pool : null;
+        return pool && sameAddress(pool.pool, address) ? pool : null;
       }),
     );
     for (const result of results) {
@@ -365,15 +489,7 @@ async function fetchGeckoPools(address, fetchImpl, timeoutMs) {
     }
   }
 
-  const seen = new Set();
-  return pools
-    .filter((pool) => {
-      const key = `${pool.chain}:${pool.pool.toLowerCase()}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .sort((a, b) => (b.tvl ?? 0) - (a.tvl ?? 0));
+  return dedupePools(pools);
 }
 
 function explorerUrl(pool) {
@@ -409,7 +525,21 @@ async function fetchGoPlus(tokenAddress, chainKey, fetchImpl, timeoutMs) {
   );
   const entry = payload?.result?.[tokenAddress.toLowerCase()]
     || Object.values(payload?.result || {})[0];
-  if (!entry) return null;
+  if (!entry || typeof entry !== "object") return null;
+
+  // GoPlus answers with an error object for unsupported chains/tokens. Treat any
+  // response without real safety fields as missing metadata (never as "safe").
+  const hasSafetyData = [
+    "is_honeypot",
+    "is_mintable",
+    "is_proxy",
+    "is_open_source",
+    "buy_tax",
+    "sell_tax",
+    "holder_count",
+    "holders",
+  ].some((key) => entry[key] != null);
+  if (!hasSafetyData) return null;
 
   const holders = Array.isArray(entry.holders) ? entry.holders : [];
   const top10Pct = holders.slice(0, 10)
@@ -444,13 +574,22 @@ async function readFeeOnChain(pool, { config, router, enableRpcFallback, timeout
   const chain = POOL_CHAINS[pool.chain];
   try {
     if (config?.rpcByChain?.[pool.chain] && router) {
-      const client = router.get(pool.chain);
-      const state = await withTimeout(
-        client.getPoolState(pool.pool),
+      const client = router.get?.(pool.chain);
+      if (client?.getPoolState) {
+        const state = await withTimeout(
+          client.getPoolState(pool.pool),
+          timeoutMs,
+          "pool fee",
+        );
+        return feeFromRaw(state?.fee);
+      }
+      if (!client?.provider?.call) return null;
+      const data = await withTimeout(
+        client.provider.call({ to: pool.pool, data: FEE_SELECTOR }),
         timeoutMs,
         "pool fee",
       );
-      return feeFromRaw(state.fee);
+      return data && data !== "0x" ? feeFromRaw(BigInt(data)) : null;
     }
     if (!chain?.rpcUrl) return null;
     const provider = new JsonRpcProvider(chain.rpcUrl, chain.chainId, { staticNetwork: true });
@@ -496,9 +635,131 @@ async function detectChainsByCode(address, { config, router, enableRpcFallback, 
     .map((result) => result.value))];
 }
 
+async function callContract(address, data, chain, { config, router, timeoutMs }) {
+  try {
+    if (config?.rpcByChain?.[chain.key] && router) {
+      const client = router.get?.(chain.key);
+      if (!client?.provider?.call) return null;
+      return await withTimeout(
+        client.provider.call({ to: address, data }),
+        timeoutMs,
+        "contract call",
+      );
+    }
+    if (!chain.rpcUrl) return null;
+    const provider = new JsonRpcProvider(chain.rpcUrl, chain.chainId, { staticNetwork: true });
+    try {
+      return await withTimeout(provider.call({ to: address, data }), timeoutMs, "contract call");
+    } finally {
+      provider.destroy();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Determine whether an address is a TOKEN or a POOL contract.
+ * A pool implements token0() and token1(); a token implements decimals().
+ * Chains are probed concurrently and API-discovered chains are tried first.
+ */
+async function probeAddressRole(address, {
+  chainKeys = [],
+  config,
+  router,
+  enableRpcFallback,
+  timeoutMs,
+}) {
+  if (!enableRpcFallback) return null;
+  const keys = [...new Set(chainKeys.filter((key) => POOL_CHAINS[key]))];
+  const chains = (keys.length ? keys : Object.keys(POOL_CHAINS))
+    .map((key) => POOL_CHAINS[key]);
+  if (chains.length === 0) return null;
+
+  const results = await Promise.allSettled(chains.map(async (chain) => {
+    const opts = { config, router, timeoutMs };
+    const [token0Data, token1Data, decimalsData] = await Promise.all([
+      callContract(address, TOKEN0_SELECTOR, chain, opts),
+      callContract(address, TOKEN1_SELECTOR, chain, opts),
+      callContract(address, DECIMALS_SELECTOR, chain, opts),
+    ]);
+
+    const token0 = decodeAddressWord(token0Data);
+    const token1 = decodeAddressWord(token1Data);
+    if (token0 && token1) {
+      let feePercent = null;
+      const feeData = await callContract(address, FEE_SELECTOR, chain, opts);
+      const rawFee = decodeUint(feeData);
+      if (rawFee != null && rawFee <= 1_000_000n) feePercent = feeFromRaw(Number(rawFee));
+      return {
+        kind: "pool",
+        chain: chain.key,
+        chainName: chain.name,
+        token0,
+        token1,
+        feePercent,
+      };
+    }
+
+    const decimals = decodeUint(decimalsData);
+    if (decimals != null && decimals <= 36n) return { kind: "token", chain: chain.key };
+    return null;
+  }));
+
+  const found = results
+    .filter((result) => result.status === "fulfilled" && result.value)
+    .map((result) => result.value);
+  return found.find((role) => role.kind === "pool")
+    || found.find((role) => role.kind === "token")
+    || null;
+}
+
+function poolTokenAddresses(pool) {
+  return [...new Set([
+    pool?.token0,
+    pool?.token1,
+    pool?.base?.address,
+    pool?.quote?.address,
+  ].map((value) => normalizeEvmAddress(value)).filter(Boolean))];
+}
+
+function poolsForToken(pools, tokenAddress) {
+  return pools.filter((pool) => poolTokenAddresses(pool)
+    .some((address) => sameAddress(address, tokenAddress)));
+}
+
+function poolsForPool(pools, poolAddress) {
+  return pools.filter((pool) => sameAddress(pool.pool, poolAddress));
+}
+
+function detectApiAddressRole(address, pools) {
+  if (pools.some((pool) => sameAddress(pool.pool, address))) return "pool";
+  if (pools.some((pool) => poolTokenAddresses(pool)
+    .some((token) => sameAddress(token, address)))) return "token";
+  return null;
+}
+
+function tokenMetaFromPool(pool, address) {
+  const target = normalizeEvmAddress(address);
+  if (!target) return null;
+  if (sameAddress(pool?.base?.address, target)) return { ...pool.base, address: target };
+  if (sameAddress(pool?.quote?.address, target)) return { ...pool.quote, address: target };
+  return { address: target, symbol: null, name: null };
+}
+
 const STABLE_SYMBOLS = new Set([
   "USDC", "USDC.E", "USDT", "DAI", "BUSD", "FDUSD", "TUSD", "USDD", "USDG",
 ]);
+
+function isStableMeta(token) {
+  return STABLE_SYMBOLS.has(String(token?.symbol || "").toUpperCase());
+}
+
+/** Pick the token whose security should drive the risk narrative. */
+function pickRiskToken(poolTokens, pool) {
+  const metas = poolTokens.map((address) => tokenMetaFromPool(pool, address)).filter(Boolean);
+  return metas.find((token) => !isStableMeta(token)) || metas[0] || null;
+}
 
 function priceForToken(pool, token) {
   if (!pool || !token) return pool?.priceUsd ?? null;
@@ -510,14 +771,89 @@ function priceForToken(pool, token) {
 
 function pickTargetToken(input, pool) {
   if (!pool) return null;
-  const target = input.toLowerCase();
-  if (String(pool.base.address || "").toLowerCase() === target) return pool.base;
-  if (String(pool.quote.address || "").toLowerCase() === target) return pool.quote;
+  const target = normalizeEvmAddress(input);
+  if (target) {
+    if (sameAddress(pool.base?.address, target)) return pool.base;
+    if (sameAddress(pool.quote?.address, target)) return pool.quote;
+  }
 
-  const baseStable = STABLE_SYMBOLS.has(String(pool.base.symbol || "").toUpperCase());
-  const quoteStable = STABLE_SYMBOLS.has(String(pool.quote.symbol || "").toUpperCase());
+  const baseStable = STABLE_SYMBOLS.has(String(pool.base?.symbol || "").toUpperCase());
+  const quoteStable = STABLE_SYMBOLS.has(String(pool.quote?.symbol || "").toUpperCase());
   if (baseStable && !quoteStable) return pool.quote;
   return pool.base;
+}
+
+/**
+ * Derive the real pool contract for bytes32 pool ids (Uniswap v4-style) using
+ * the v3 factory when tokens and a fee tier are known.
+ */
+async function resolveBytes32PoolAddress(pool, {
+  config,
+  router,
+  enableRpcFallback,
+  timeoutMs,
+}) {
+  const rawId = String(pool.poolId || "");
+  if (!enableRpcFallback || !/^0x[0-9a-fA-F]{64}$/.test(rawId)) return pool.pool;
+  if (/^0x0{24}/.test(rawId)) return pool.pool;
+  if (!pool.feeRaw || !pool.base?.address || !pool.quote?.address) return pool.pool;
+  if (!config?.rpcByChain?.[pool.chain] || !router) return pool.pool;
+  try {
+    const client = router.get?.(pool.chain);
+    if (!client?.getPoolAddress) return pool.pool;
+    const address = await withTimeout(
+      client.getPoolAddress({
+        tokenA: pool.base.address,
+        tokenB: pool.quote.address,
+        fee: Number(pool.feeRaw),
+      }),
+      timeoutMs,
+      "pool address",
+    );
+    return normalizeEvmAddress(address) || pool.pool;
+  } catch {
+    return pool.pool;
+  }
+}
+
+/** Minimal pool record when only on-chain identity is available. */
+function syntheticPool({ address, chainKey, tokens, feePercent }) {
+  const chain = POOL_CHAINS[chainKey];
+  const metas = tokens.map((token) => ({
+    address: token,
+    symbol: shortAddress(token),
+    name: null,
+  }));
+  const [token0, token1] = sortTokenAddresses(metas[0]?.address, metas[1]?.address);
+  return {
+    source: "rpc",
+    chain: chainKey,
+    dex: `${chain.name} pool`,
+    dexId: "",
+    pair: `${metas[0]?.symbol || "?"}/${metas[1]?.symbol || "?"}`,
+    pool: address,
+    poolId: address,
+    feePercent: feePercent ?? null,
+    feeRaw: null,
+    tvl: null,
+    volume24h: null,
+    priceUsd: null,
+    priceNative: null,
+    quotePriceUsd: null,
+    priceChange24h: null,
+    marketCap: null,
+    fdv: null,
+    buys: 0,
+    sells: 0,
+    txns24h: 0,
+    createdAt: null,
+    token0,
+    token1,
+    base: metas.find((meta) => sameAddress(meta.address, token0)) || metas[0],
+    quote: metas.find((meta) => sameAddress(meta.address, token1)) || metas[1],
+    labels: [],
+    chartUrl: `https://www.geckoterminal.com/${chain.gecko}/pools/${address}`,
+  };
 }
 
 export function buildNarrative(primary, holders = null) {
@@ -610,8 +946,10 @@ export function buildNarrative(primary, holders = null) {
   }
 
   let safetyNote;
-  if (!flags) safetyNote = "Token tax/holder safety metadata unavailable (GoPlus).";
-  else {
+  if (!flags) {
+    safetyNote = "GoPlus has no safety data for this token/chain; treat as unverified "
+      + "risk, not as safe.";
+  } else {
     const parts = [
       `honeypot: ${flags.honeypot == null ? "n/a" : flags.honeypot ? "yes" : "no"}`,
       `buy tax: ${flags.buyTax == null ? "n/a" : `${flags.buyTax.toFixed(1)}%`}`,
@@ -621,6 +959,14 @@ export function buildNarrative(primary, holders = null) {
       `open source: ${flags.openSource == null ? "n/a" : flags.openSource ? "yes" : "no"}`,
     ];
     safetyNote = parts.join(" | ");
+  }
+
+  // Missing GoPlus metadata must never read as "LOW". Keep a HIGH risk derived
+  // from liquidity/holder structure, but otherwise surface UNVERIFIED / MEDIUM.
+  if (!flags) {
+    const warning = "⚠️ Token safety metadata unverified";
+    if (!reasons.includes(warning)) reasons.unshift(warning);
+    if (riskStatus !== "HIGH") riskStatus = "UNVERIFIED";
   }
 
   if (reasons.length === 0) reasons.push("No major automated risk flags detected.");
@@ -634,6 +980,7 @@ export function buildNarrative(primary, holders = null) {
     activityNote,
     safetyNote,
     riskStatus,
+    riskSeverity: riskStatus === "UNVERIFIED" ? "MEDIUM" : riskStatus,
     reasons,
   };
 }
@@ -673,14 +1020,47 @@ export async function analyzePoolAddress({
     }
   }
 
-  if (pools.length === 0) {
-    const detected = await detectChainsByCode(input, {
+  // Convert bytes32 pair ids/topics returned by DexScreener into real pool
+  // contracts (v3 factory) before anything is displayed.
+  if (pools.length > 0 && enableRpcFallback) {
+    pools = await Promise.all(pools.map(async (pool) => {
+      const resolved = await resolveBytes32PoolAddress(pool, {
+        config,
+        router,
+        enableRpcFallback,
+        timeoutMs,
+      });
+      if (resolved && !sameAddress(resolved, pool.pool)) {
+        pool.poolId = pool.pool;
+        pool.pool = resolved;
+      }
+      return pool;
+    }));
+    pools = dedupePools(pools);
+  }
+
+  const apiRole = detectApiAddressRole(input, pools);
+  const detectedChains = pools.length > 0
+    ? []
+    : await detectChainsByCode(input, {
       config,
       router,
       enableRpcFallback,
       timeoutMs,
     });
-    if (detected.length === 0) {
+  const chainCandidates = pools.length > 0
+    ? [...new Set(pools.map((pool) => pool.chain))]
+    : detectedChains;
+  const onChainRole = await probeAddressRole(input, {
+    chainKeys: chainCandidates,
+    config,
+    router,
+    enableRpcFallback,
+    timeoutMs,
+  });
+
+  if (pools.length === 0 && !onChainRole) {
+    if (detectedChains.length === 0) {
       return {
         address: input,
         pools: [],
@@ -689,7 +1069,7 @@ export async function analyzePoolAddress({
           + "Check the contract address and configured networks.",
       };
     }
-    const chain = POOL_CHAINS[detected[0]];
+    const chain = POOL_CHAINS[detectedChains[0]];
     return {
       address: input,
       chain: chain.key,
@@ -706,12 +1086,66 @@ export async function analyzePoolAddress({
     };
   }
 
-  pools = pools.slice(0, MAX_POOLS);
-  const primary = pools[0];
-  const chain = POOL_CHAINS[primary.chain];
-  const token = pickTargetToken(input, primary);
+  const addressType = onChainRole?.kind || apiRole || "token";
 
-  await Promise.all(pools.slice(0, 3).map(async (pool) => {
+  let scopedPools = [];
+  let primary = null;
+  let chain = null;
+  let poolTokens = [];
+
+  if (addressType === "pool") {
+    scopedPools = poolsForPool(pools, input).slice(0, MAX_POOLS);
+    primary = scopedPools[0] || null;
+    const poolChainKey = primary?.chain || onChainRole?.chain || chainCandidates[0];
+    chain = POOL_CHAINS[poolChainKey] || null;
+
+    poolTokens = [...new Set([
+      onChainRole?.token0,
+      onChainRole?.token1,
+      ...(primary ? poolTokenAddresses(primary) : []),
+    ].filter(Boolean))];
+
+    if (!primary && chain && poolTokens.length >= 2) {
+      primary = syntheticPool({
+        address: input,
+        chainKey: chain.key,
+        tokens: poolTokens.slice(0, 2),
+        feePercent: onChainRole?.feePercent,
+      });
+      scopedPools = [primary];
+    }
+    if (primary) {
+      if (onChainRole?.token0 && onChainRole?.token1) {
+        [primary.token0, primary.token1] = sortTokenAddresses(
+          onChainRole.token0,
+          onChainRole.token1,
+        );
+      }
+      primary.feePercent = primary.feePercent ?? onChainRole?.feePercent ?? null;
+    }
+  } else {
+    // Token address: resolve every pool where token0 == address OR token1 == address.
+    scopedPools = poolsForToken(pools, input);
+    if (scopedPools.length === 0) scopedPools = pools;
+    scopedPools = scopedPools.slice(0, MAX_POOLS);
+    primary = scopedPools[0] || null;
+    const tokenChainKey = primary?.chain || onChainRole?.chain || chainCandidates[0];
+    chain = POOL_CHAINS[tokenChainKey] || null;
+    poolTokens = [input];
+  }
+
+  if (!chain) {
+    return {
+      address: input,
+      pools: [],
+      errors,
+      error: "No supported EVM chain or active DEX pool found for this address. "
+        + "Check the contract address and configured networks.",
+    };
+  }
+
+  // Read fee() on-chain for every displayed pool whose API fee is missing.
+  await Promise.all(scopedPools.map(async (pool) => {
     if (pool.feePercent == null) {
       pool.feePercent = await readFeeOnChain(pool, {
         config,
@@ -722,23 +1156,50 @@ export async function analyzePoolAddress({
     }
   }));
 
-  let holders = null;
-  if (token?.address) {
+  // Token-level security: a token input queries GoPlus with the TOKEN address;
+  // a pool input queries GoPlus for both underlying token0 and token1.
+  const securityTargets = addressType === "pool" ? poolTokens : [input];
+  const securities = [];
+  for (const address of securityTargets) {
+    let security = null;
     try {
-      holders = await fetchGoPlus(token.address, primary.chain, fetchImpl, timeoutMs);
+      security = await fetchGoPlus(address, chain.key, fetchImpl, timeoutMs);
     } catch (error) {
-      errors.push(`GoPlus: ${error.message || String(error)}`);
+      errors.push(`GoPlus (${shortAddress(address)}): ${error.message || String(error)}`);
     }
+    if (!security) {
+      errors.push(`GoPlus: no safety metadata for ${shortAddress(address)} on ${chain.name}`);
+    }
+    securities.push({ address, security });
   }
+
+  const picked = addressType === "pool"
+    ? pickRiskToken(poolTokens, primary)
+    : pickTargetToken(input, primary);
+  const token = picked
+    ? { address: input === picked.address ? input : picked.address, symbol: picked.symbol, name: picked.name }
+    : { address: input, symbol: null, name: null };
+  if (addressType === "token") token.address = input;
+
+  // Never substitute another token's security data: a missing risk-token record
+  // must stay UNVERIFIED instead of inheriting a verified stablecoin's LOW risk.
+  const holders = securities
+    .find((entry) => sameAddress(entry.address, token.address))?.security
+    || null;
 
   return {
     address: input,
-    chain: primary.chain,
+    addressType,
+    kind: addressType,
+    chain: chain.key,
     chainName: chain.name,
     chainId: chain.chainId,
     token,
-    priceUsd: priceForToken(primary, token),
-    pools,
+    poolTokens,
+    tokenSecurities: securities,
+    securityVerified: Boolean(holders),
+    priceUsd: primary ? priceForToken(primary, token) : null,
+    pools: scopedPools,
     primary,
     holders,
     narrative: buildNarrative(primary, holders),
@@ -794,7 +1255,11 @@ export function formatPoolAnalysis(analysis = {}) {
     return lines.join("\n");
   }
 
-  lines.push(`Address: <code>${escapeHtml(analysis.address)}</code>`);
+  const displayAddress = normalizeEvmAddress(analysis.address) || analysis.address;
+  lines.push(`Address: <code>${escapeHtml(displayAddress)}</code>`);
+  if (analysis.addressType) {
+    lines.push(`Type: <b>${analysis.addressType === "pool" ? "POOL" : "TOKEN"}</b>`);
+  }
   if (analysis.chainName) {
     lines.push(`Chain: <b>${escapeHtml(analysis.chainName)}</b> (${escapeHtml(analysis.chainId)})`);
   }
@@ -804,7 +1269,16 @@ export function formatPoolAnalysis(analysis = {}) {
       `Token: <b>${escapeHtml(token.symbol || "?")}</b>`
       + `${token.name ? ` — ${escapeHtml(token.name)}` : ""}`,
     );
-    if (token.address) lines.push(`Token contract: <code>${escapeHtml(token.address)}</code>`);
+    const tokenAddress = normalizeEvmAddress(token.address);
+    if (tokenAddress) lines.push(`Token contract: <code>${escapeHtml(tokenAddress)}</code>`);
+  }
+  if (analysis.poolTokens?.length) {
+    const poolTokenAddresses = analysis.poolTokens
+      .map((address) => normalizeEvmAddress(address))
+      .filter(Boolean);
+    if (poolTokenAddresses.length) {
+      lines.push(`Pool tokens: <code>${poolTokenAddresses.map(escapeHtml).join("</code> / <code>")}</code>`);
+    }
   }
 
   if (analysis.note) {
@@ -814,24 +1288,23 @@ export function formatPoolAnalysis(analysis = {}) {
   lines.push("", `<b>Liquidity &amp; Pools</b> (${analysis.pools?.length || 0} found)`);
   if (!analysis.pools?.length) {
     lines.push("No active DEX pools found.");
-    if (analysis.errors?.length) {
-      lines.push("", `<i>Data warnings: ${analysis.errors.map(escapeHtml).join("; ")}</i>`);
-    }
-    return lines.join("\n");
   }
 
-  for (const [index, pool] of (analysis.pools || []).entries()) {
+  const shownPools = (analysis.pools || []).slice(0, DETAILED_POOLS);
+  for (const [index, pool] of shownPools.entries()) {
+    const poolAddress = normalizeEvmAddress(pool.pool);
+    if (!poolAddress) continue;
     const links = [];
     if (pool.chartUrl) {
       links.push(`<a href="${escapeHtmlAttr(pool.chartUrl)}">Chart</a>`);
     }
     const dexUrl = dexPoolUrl(pool);
     if (dexUrl) links.push(`<a href="${escapeHtmlAttr(dexUrl)}">DEX</a>`);
-    links.push(`<a href="${escapeHtmlAttr(explorerUrl(pool))}">Explorer</a>`);
+    links.push(`<a href="${escapeHtmlAttr(explorerUrl({ ...pool, pool: poolAddress }))}">Explorer</a>`);
 
     lines.push(`${index + 1}. <b>${escapeHtml(pool.pair)}</b> — ${escapeHtml(pool.dex)}`);
     lines.push(
-      `   Pool <code>${escapeHtml(pool.pool)}</code> | fee ${fmtFee(pool.feePercent)}`,
+      `   Pool <code>${escapeHtml(poolAddress)}</code> | fee ${fmtFee(pool.feePercent)}`,
     );
     lines.push(
       `   TVL ${fmtMoney(pool.tvl)} | Vol24h ${fmtMoney(pool.volume24h)} | `
@@ -845,6 +1318,18 @@ export function formatPoolAnalysis(analysis = {}) {
       + `MC ${fmtMoney(pool.marketCap)} | FDV ${fmtMoney(pool.fdv)}`,
     );
     lines.push(`   ${links.join(" | ")}`);
+  }
+
+  const minorPools = (analysis.pools || []).slice(DETAILED_POOLS);
+  if (minorPools.length > 0) {
+    const minorTvl = minorPools.reduce((sum, pool) => sum + (num(pool.tvl) ?? 0), 0);
+    const labels = minorPools.map((pool) => {
+      const poolAddress = normalizeEvmAddress(pool.pool);
+      return `${pool.pair}${poolAddress ? ` (${shortAddress(poolAddress)})` : ""} ${fmtMoney(pool.tvl)}`;
+    });
+    lines.push(
+      `…+${minorPools.length} minor pools (${fmtMoney(minorTvl)} TVL): ${labels.join(", ")}`,
+    );
   }
 
   const holders = analysis.holders;
@@ -862,14 +1347,26 @@ export function formatPoolAnalysis(analysis = {}) {
     lines.push(`Top holders: ${top}`);
   }
   lines.push(`Safety: ${escapeHtml(narrative.safetyNote)}`);
+  if (!holders) lines.push("⚠️ Token safety metadata unverified");
+  if (analysis.addressType === "pool" && analysis.tokenSecurities?.length) {
+    const checks = analysis.tokenSecurities.map((entry) => {
+      const address = normalizeEvmAddress(entry.address);
+      return `<code>${escapeHtml(address ? shortAddress(address) : "n/a")}</code> `
+        + `${entry.security ? "verified" : "UNVERIFIED"}`;
+    });
+    lines.push(`Pool token checks: ${checks.join(" | ")}`);
+  }
   lines.push(`Activity: ${escapeHtml(narrative.activityNote)}`);
 
   lines.push("", "<b>Narrative &amp; Market Insight</b>");
   lines.push(`Volume health: ${escapeHtml(narrative.volumeHealth)}`);
   lines.push(`Liquidity depth: ${escapeHtml(narrative.liquidityNote)}`);
   lines.push(`Holder profile: ${escapeHtml(narrative.holderNote)}`);
+  const riskLabel = narrative.riskStatus === "UNVERIFIED"
+    ? "UNVERIFIED (MEDIUM)"
+    : narrative.riskStatus;
   lines.push(
-    `Risk: <b>${escapeHtml(narrative.riskStatus)}</b> — `
+    `Risk: <b>${escapeHtml(riskLabel)}</b> — `
     + `${escapeHtml(narrative.reasons.join("; "))}`,
   );
 
