@@ -62,6 +62,15 @@ the top 3 pools by TVL are detailed. Missing GoPlus metadata is reported as
 Polygon, Avalanche, Optimism and Robinhood Chain through DexScreener,
 GeckoTerminal, GoPlus and on-chain fee reads.
 
+Fee tiers are resolved in this order: DexScreener/GeckoTerminal -> secondary
+indexer/subgraph -> on-chain `fee()` RPC. When an aggregator returns `fee n/a`
+(for example on Robinhood Chain 4663), set `INDEXER_API_URL` or a chain-scoped
+`SUBGRAPH_URL_<chainId>` (such as `SUBGRAPH_URL_4663`) to query the Uniswap v3
+`Pool` entity for the exact `feeTier` and `tickSpacing`. GraphQL subgraphs,
+Envio and Defined.fi-style REST endpoints are supported (`INDEXER_API_TYPE`).
+The resolved tier is shown directly in the report, e.g.
+`SEASON/ETH — Uniswap v3 (0.05%)`.
+
 `TELEGRAM_ENABLED` controls exit/alert notifications independently.
 `TELEGRAM_COMMANDS_ENABLED=false` disables the command menu.
 

@@ -148,6 +148,28 @@ test("positions resolve their own chain from chain or chainId", () => {
   }
 });
 
+test("indexer env vars map per chain and fall back to INDEXER_API_URL", () => {
+  withEnv({
+    INDEXER_API_URL: "https://indexer.example/graphql",
+    INDEXER_API_TYPE: "graphql",
+    INDEXER_API_KEY: "secret",
+    INDEXER_TIMEOUT_MS: "5000",
+    SUBGRAPH_URL_4663: "https://robinhood.example/graphql",
+  }, () => {
+    const config = loadConfig({ allowEmptyPositions: true });
+    assert.equal(config.indexer.enabled, true);
+    assert.equal(config.indexer.url, "https://indexer.example/graphql");
+    assert.equal(config.indexer.type, "graphql");
+    assert.equal(config.indexer.apiKey, "secret");
+    assert.equal(config.indexer.timeoutMs, 5000);
+    assert.equal(
+      config.indexer.byChain.robinhood,
+      "https://robinhood.example/graphql",
+    );
+    assert.equal(config.indexer.byChain.base, undefined);
+  });
+});
+
 test("chainRuntimeConfig swaps chain metadata and its RPC route", () => {
   const config = loadConfig({ chain: "base", allowEmptyPositions: true });
   const bnb = chainRuntimeConfig(config, "bsc");

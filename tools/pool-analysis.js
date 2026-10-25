@@ -16,6 +16,40 @@ const SYMBOL_SELECTOR = "0x95d89b41";
 const MAX_POOLS = 10;
 const DETAILED_POOLS = 3;
 
+// ─── Indexer / subgraph endpoints ────────────────────────────────────
+// Secondary source for pool metadata when DexScreener/GeckoTerminal omit the
+// Uniswap v3 fee tier (common on newer EVM chains such as Robinhood Chain).
+const INDEXER_PROTOCOLS = new Set([
+  "auto",
+  "graphql",
+  "subgraph",
+  "envio",
+  "defined",
+  "rest",
+]);
+
+const INDEXER_GRAPHQL_QUERY = `
+query MorpheusPoolMetadata($id: ID!) {
+  pool(id: $id) {
+    id
+    feeTier
+    tickSpacing
+    token0 { id symbol name }
+    token1 { id symbol name }
+  }
+}`.trim();
+
+const INDEXER_GRAPHQL_MIN_QUERY = `
+query MorpheusPoolFee($id: ID!) {
+  pool(id: $id) {
+    id
+    feeTier
+    tickSpacing
+    token0 { id symbol }
+    token1 { id symbol }
+  }
+}`.trim();
+
 /** Supported analysis networks, including chains without a configured bot RPC. */
 export const POOL_CHAINS = {
   ethereum: {
@@ -251,6 +285,398 @@ function resolveFeePercent(...candidates) {
   return null;
 }
 
+// ─── Indexer service (Subgraph / Defined.fi / Envio) ─────────────────
+// Resolves the canonical Uniswap v3 fee tier (uint24) and tick spacing from a
+// Pool/Factory entity. Endpoints are configured through `INDEXER_API_URL`,
+// a per-chain `SUBGRAPH_URL_<chainId>` (e.g. SUBGRAPH_URL_4663) or
+// `config.indexer.byChain`. GraphQL first, REST as a compatibility fallback.
+
+/** Canonical Uniswap v3 fee tiers keyed by raw uint24 value. */
+export const UNISWAP_FEE_TIERS = Object.freeze({
+  100: "0.01%",
+  500: "0.05%",
+  3000: "0.3%",
+  10000: "1.0%",
+});
+
+function formatFeeLabel(percent) {
+  const canonical = {
+    0.01: "0.01%",
+    0.05: "0.05%",
+    0.3: "0.3%",
+    1: "1.0%",
+  }[Number(percent.toFixed(6))];
+  return canonical || `${Number(percent.toFixed(4))}%`;
+}
+
+/**
+ * Convert a raw fee tier (100, 500, 3000, 10000), a fraction (0.0005) or a
+ * pre-formatted percentage ("0.05%") into the user-facing tier label.
+ */
+export function feeTierLabel(value) {
+  if (value == null || value === "") return null;
+
+  let number;
+  if (typeof value === "string") {
+    const parsed = parseFeePercent(value);
+    if (parsed != null) return formatFeeLabel(parsed);
+    if (!/^-?\d+(?:\.\d+)?$/.test(value.trim())) return null;
+    number = Number(value);
+  } else {
+    number = Number(value);
+  }
+  if (!Number.isFinite(number) || number < 0) return null;
+
+  // Raw uint24 tiers are integers; known tiers map directly.
+  if (Number.isInteger(number) && UNISWAP_FEE_TIERS[number]) {
+    return UNISWAP_FEE_TIERS[number];
+  }
+  // Already a percentage, or a fraction such as 0.0005 -> 0.05%.
+  return formatFeeLabel(number < 0.01 ? number * 100 : number);
+}
+
+function isRecord(value) {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Resolve the indexer settings that apply to one supported chain. */
+function indexerForChain(config, chainKey) {
+  const chain = POOL_CHAINS[chainKey];
+  if (!chain) return null;
+  const settings = isRecord(config?.indexer) ? config.indexer : {};
+  if (settings.enabled === false) return null;
+
+  const byChain = isRecord(settings.byChain) ? settings.byChain : {};
+  const chainSpecific = [
+    byChain[chainKey],
+    byChain[String(chain.chainId)],
+    process.env?.[`SUBGRAPH_URL_${chain.chainId}`],
+    process.env?.[`INDEXER_API_URL_${chain.chainId}`],
+  ].map((value) => String(value || "").trim()).find(Boolean);
+
+  const url = chainSpecific
+    || String(settings.url || "").trim()
+    || String(process.env?.INDEXER_API_URL || "").trim();
+  if (!url) return null;
+
+  const requestedType = String(
+    settings.type || process.env?.INDEXER_API_TYPE || "auto",
+  ).trim().toLowerCase();
+  const type = INDEXER_PROTOCOLS.has(requestedType) ? requestedType : "auto";
+  const inferredType = type !== "auto"
+    ? type
+    : /defined/i.test(url)
+      ? "defined"
+      : /envio/i.test(url)
+        ? "envio"
+        : "subgraph";
+
+  return {
+    url,
+    type,
+    source: inferredType === "rest" ? "indexer" : inferredType,
+    apiKey: String(settings.apiKey || process.env?.INDEXER_API_KEY || "").trim(),
+    timeoutMs: num(settings.timeoutMs) > 0 ? num(settings.timeoutMs) : 8_000,
+    chainKey,
+  };
+}
+
+function indexerHeaders(indexer, { json = false } = {}) {
+  const headers = { accept: "application/json" };
+  if (json) headers["content-type"] = "application/json";
+  if (indexer.apiKey) {
+    headers.authorization = `Bearer ${indexer.apiKey}`;
+    headers["x-api-key"] = indexer.apiKey;
+  }
+  return headers;
+}
+
+async function indexerRequest(url, options, fetchImpl, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(url, { ...options, signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Protocols to try for an endpoint, in priority order. */
+function indexerProtocolOrder(indexer) {
+  if (indexer.type === "graphql" || indexer.type === "subgraph" || indexer.type === "envio") {
+    return ["graphql"];
+  }
+  if (indexer.type === "rest" || indexer.type === "defined") return ["rest", "graphql"];
+  return ["graphql", "rest"];
+}
+
+function normalizeIndexerToken(value, symbol = null) {
+  if (isRecord(value)) {
+    return {
+      address: normalizeEvmAddress(value.id || value.address || value.tokenAddress),
+      symbol: value.symbol || value.tokenSymbol || symbol || null,
+      name: value.name || null,
+    };
+  }
+  return {
+    address: normalizeEvmAddress(value),
+    symbol: symbol || null,
+    name: null,
+  };
+}
+
+/** Pick the entity carrying fee/token metadata from a GraphQL/REST payload. */
+function pickIndexerEntity(payload) {
+  const candidates = [
+    payload?.data?.pool,
+    Array.isArray(payload?.data?.pools) ? payload.data.pools[0] : null,
+    payload?.data?.data?.pool,
+    Array.isArray(payload?.data?.data?.pools) ? payload.data.data.pools[0] : null,
+    payload?.pool,
+    Array.isArray(payload?.pools) ? payload.pools[0] : null,
+    payload?.result?.pool,
+    Array.isArray(payload?.result?.pools) ? payload.result.pools[0] : null,
+    payload?.result,
+    payload?.data,
+    payload,
+  ];
+  return candidates.find((entry) => isRecord(entry) && (
+    entry.feeTier != null
+    || entry.fee_tier != null
+    || entry.fee != null
+    || entry.tickSpacing != null
+    || entry.tick_spacing != null
+    || (isRecord(entry.pool) && (entry.pool.feeTier != null || entry.pool.fee != null))
+    || entry.token0 != null
+    || entry.token1 != null
+  )) || null;
+}
+
+/** Normalize an indexer Pool entity into the internal pool metadata shape. */
+function normalizeIndexerPool(payload, indexer) {
+  const entity = pickIndexerEntity(payload);
+  if (!entity) return null;
+
+  const nested = isRecord(entity.pool) ? entity.pool : {};
+  const rawFee = entity.feeTier
+    ?? entity.fee_tier
+    ?? nested.feeTier
+    ?? nested.fee_tier
+    ?? entity.fee
+    ?? nested.fee
+    ?? null;
+  const feePercent = resolveFeePercent(rawFee);
+  const rawFeeNumber = Number(rawFee);
+  const feeTier = Number.isInteger(rawFeeNumber) && rawFeeNumber > 0 && rawFeeNumber <= 1_000_000
+    ? rawFeeNumber
+    : null;
+  const tickSpacing = num(
+    entity.tickSpacing ?? entity.tick_spacing ?? nested.tickSpacing ?? null,
+  );
+
+  const tokenA = normalizeIndexerToken(
+    entity.token0 ?? entity.token0Address ?? null,
+    entity.token0Symbol ?? entity.baseTokenSymbol ?? null,
+  );
+  const tokenB = normalizeIndexerToken(
+    entity.token1 ?? entity.token1Address ?? null,
+    entity.token1Symbol ?? entity.quoteTokenSymbol ?? null,
+  );
+  const [token0, token1] = tokenA.address && tokenB.address
+    ? sortTokenAddresses(tokenA.address, tokenB.address)
+    : [tokenA.address, tokenB.address];
+  const base = sameAddress(tokenA.address, token0) ? tokenA
+    : sameAddress(tokenB.address, token0) ? tokenB : null;
+  const quote = sameAddress(tokenA.address, token1) ? tokenA
+    : sameAddress(tokenB.address, token1) ? tokenB : null;
+  const poolAddress = normalizeEvmAddress(entity.id)
+    || normalizeEvmAddress(entity.address)
+    || normalizeEvmAddress(entity.poolAddress)
+    || normalizeEvmAddress(nested.id)
+    || null;
+  const dexId = String(
+    (isRecord(entity.dex) ? entity.dex.id : entity.dexId) || nested.dexId || "",
+  );
+
+  return {
+    source: indexer.source,
+    chain: indexer.chainKey,
+    pool: poolAddress,
+    feePercent,
+    feeTier,
+    tickSpacing,
+    feeRaw: rawFee,
+    token0,
+    token1,
+    base: base ? { address: base.address, symbol: base.symbol, name: base.name } : null,
+    quote: quote ? { address: quote.address, symbol: quote.symbol, name: quote.name } : null,
+    pair: base?.symbol && quote?.symbol ? `${base.symbol}/${quote.symbol}` : null,
+    dexId,
+    dex: dexId ? dexName(dexId) : "Uniswap v3",
+  };
+}
+
+/** Remaining time before the shared indexer deadline expires. */
+function remainingBudget(deadline) {
+  return Math.max(250, deadline - Date.now());
+}
+
+async function queryIndexerGraphql(indexer, address, fetchImpl, deadline) {
+  for (const query of [INDEXER_GRAPHQL_QUERY, INDEXER_GRAPHQL_MIN_QUERY]) {
+    if (deadline - Date.now() <= 0) break;
+    const payload = await indexerRequest(indexer.url, {
+      method: "POST",
+      headers: indexerHeaders(indexer, { json: true }),
+      body: JSON.stringify({ query, variables: { id: address.toLowerCase() } }),
+    }, fetchImpl, remainingBudget(deadline));
+    if (Array.isArray(payload?.errors) && payload.errors.length > 0) continue;
+    const pool = normalizeIndexerPool(payload, indexer);
+    if (pool) return pool;
+  }
+  return null;
+}
+
+async function queryIndexerRest(indexer, address, fetchImpl, deadline) {
+  const base = indexer.url.replace(/\/+$/, "");
+  const endpoints = base.endsWith("/pools")
+    ? [`${base}/${address}`]
+    : [`${base}/pools/${address}`, `${base}/pool/${address}`];
+
+  for (const endpoint of endpoints) {
+    if (deadline - Date.now() <= 0) break;
+    const payload = await indexerRequest(endpoint, {
+      method: "GET",
+      headers: indexerHeaders(indexer),
+    }, fetchImpl, remainingBudget(deadline));
+    const pool = normalizeIndexerPool(payload, indexer);
+    if (pool) return pool;
+  }
+  return null;
+}
+
+/**
+ * Query the configured indexer/subgraph for one pool address.
+ * Returns `{ source, feeTier, feePercent, tickSpacing, token0, token1, ... }`
+ * or `null` when no indexer is configured or the pool is unknown.
+ */
+export async function fetchIndexerPool(poolAddress, {
+  chainKey,
+  config = {},
+  fetchImpl = globalThis.fetch,
+  timeoutMs = 8_000,
+} = {}) {
+  const address = normalizeEvmAddress(poolAddress);
+  const indexer = chainKey ? indexerForChain(config, chainKey) : null;
+  if (!address || !indexer) return null;
+
+  const budget = Math.max(250, Math.min(
+    Number(timeoutMs) > 0 ? Number(timeoutMs) : indexer.timeoutMs,
+    indexer.timeoutMs,
+  ));
+  const deadline = Date.now() + budget;
+
+  for (const protocol of indexerProtocolOrder(indexer)) {
+    if (deadline - Date.now() <= 0) break;
+    try {
+      const pool = protocol === "graphql"
+        ? await queryIndexerGraphql(indexer, address, fetchImpl, deadline)
+        : await queryIndexerRest(indexer, address, fetchImpl, deadline);
+      if (pool && (!pool.pool || sameAddress(pool.pool, address))) {
+        return { ...pool, pool: pool.pool || address };
+      }
+    } catch {
+      // Try the next protocol (GraphQL <-> REST) before giving up.
+    }
+  }
+  return null;
+}
+
+/**
+ * Ordered chain candidates for an indexer lookup. Chain-scoped URLs win over a
+ * generic INDEXER_API_URL, so custom chains can be queried deterministically.
+ */
+function indexerChainCandidates(config, preferred = []) {
+  const settings = isRecord(config?.indexer) ? config.indexer : {};
+  const explicit = String(settings.chain ?? "").trim().toLowerCase();
+  const explicitChain = explicit
+    ? Object.values(POOL_CHAINS).find(
+      (chain) => chain.key === explicit || String(chain.chainId) === explicit,
+    )
+    : null;
+  const ordered = [
+    ...preferred,
+    explicitChain?.key,
+    String(config?.chain || "").trim().toLowerCase() || null,
+    ...Object.keys(settings.byChain || {}),
+  ].filter((key) => key && POOL_CHAINS[key]);
+
+  // A generic endpoint has no chain in its URL, so probe every supported chain.
+  if (settings.url || process.env?.INDEXER_API_URL) {
+    ordered.push(...Object.keys(POOL_CHAINS));
+  }
+  return [...new Set(ordered)];
+}
+
+/** Apply indexer metadata to an existing pool without overwriting API values. */
+function applyIndexerMetadata(pool, indexed) {
+  if (!pool || !indexed) return false;
+  let applied = false;
+  if (pool.feePercent == null && indexed.feePercent != null) {
+    pool.feePercent = indexed.feePercent;
+    pool.feeSource = indexed.source;
+    applied = true;
+  }
+  if (pool.feeTier == null && indexed.feeTier != null) {
+    pool.feeTier = indexed.feeTier;
+    applied = true;
+  }
+  if (pool.tickSpacing == null && indexed.tickSpacing != null) {
+    pool.tickSpacing = indexed.tickSpacing;
+    applied = true;
+  }
+  return applied;
+}
+
+/** Build a displayable pool from indexer-only metadata (no aggregator hit). */
+function poolFromIndexer(indexed) {
+  if (!indexed?.chain || !POOL_CHAINS[indexed.chain]) return null;
+  const tokens = [indexed.token0, indexed.token1].filter(
+    (address) => normalizeEvmAddress(address),
+  );
+  if (tokens.length < 2 || !normalizeEvmAddress(indexed.pool)) return null;
+
+  const pool = syntheticPool({
+    address: indexed.pool,
+    chainKey: indexed.chain,
+    tokens: tokens.slice(0, 2),
+    feePercent: indexed.feePercent,
+    feeTier: indexed.feeTier,
+    tickSpacing: indexed.tickSpacing,
+    feeSource: indexed.source,
+  });
+
+  const metaFor = (address) => [indexed.base, indexed.quote].find(
+    (token) => token && sameAddress(token.address, address),
+  );
+  const baseMeta = metaFor(pool.base?.address);
+  const quoteMeta = metaFor(pool.quote?.address);
+  if (baseMeta) pool.base = { ...pool.base, ...baseMeta, address: pool.base.address };
+  if (quoteMeta) pool.quote = { ...pool.quote, ...quoteMeta, address: pool.quote.address };
+
+  pool.source = indexed.source;
+  pool.feeTier = indexed.feeTier ?? pool.feeTier;
+  pool.tickSpacing = indexed.tickSpacing ?? pool.tickSpacing;
+  pool.feeRaw = indexed.feeRaw ?? indexed.feeTier ?? pool.feeRaw;
+  pool.dex = indexed.dex || "Uniswap v3";
+  pool.dexId = indexed.dexId || "uniswap-v3";
+  pool.pair = indexed.pair || pool.pair;
+  pool.labels = ["v3"];
+  return pool;
+}
+
+
 function dexName(dexId) {
   const id = String(dexId || "").toLowerCase();
   if (id.includes("uniswap")) return "Uniswap v3";
@@ -279,6 +705,8 @@ function normalizeDexPair(pair) {
   const buys = num(pair.txns?.h24?.buys) || 0;
   const sells = num(pair.txns?.h24?.sells) || 0;
   const rawFee = pair.feeTier ?? pair.fee;
+  const feePercent = resolveFeePercent(rawFee, pair.feeTier, pair.fee, pair.name);
+  const rawFeeNumber = Number(rawFee);
   const chain = POOL_CHAINS[chainKey];
 
   return {
@@ -289,7 +717,9 @@ function normalizeDexPair(pair) {
     pair: `${pair.baseToken?.symbol || "?"}/${pair.quoteToken?.symbol || "?"}`,
     pool,
     poolId: String(pair.pairAddress || ""),
-    feePercent: resolveFeePercent(rawFee, pair.feeTier, pair.fee, pair.name),
+    feePercent,
+    feeTier: Number.isInteger(rawFeeNumber) && rawFeeNumber > 0 ? rawFeeNumber : null,
+    feeSource: feePercent != null ? "dexscreener" : null,
     feeRaw: rawFee,
     tvl: num(pair.liquidity?.usd),
     volume24h: num(pair.volume?.h24),
@@ -403,6 +833,14 @@ function normalizeGeckoPool(item) {
   const baseAddress = normalizeEvmAddress(geckoIdPart(item.relationships?.base_token?.data?.id));
   const quoteAddress = normalizeEvmAddress(geckoIdPart(item.relationships?.quote_token?.data?.id));
   const [token0, token1] = sortTokenAddresses(baseAddress, quoteAddress);
+  const rawFee = attrs.fee_tier ?? attrs.fee ?? null;
+  const feePercent = resolveFeePercent(
+    attrs.fee_tier,
+    attrs.fee,
+    attrs.pool_fee_percentage,
+    attrs.name,
+  );
+  const rawFeeNumber = Number(rawFee);
 
   return {
     source: "geckoterminal",
@@ -412,13 +850,10 @@ function normalizeGeckoPool(item) {
     pair: `${baseSymbol || "?"}/${quoteSymbol || "?"}`,
     pool,
     poolId: String(attrs.address || geckoIdPart(item.id) || ""),
-    feePercent: resolveFeePercent(
-      attrs.fee_tier,
-      attrs.fee,
-      attrs.pool_fee_percentage,
-      attrs.name,
-    ),
-    feeRaw: attrs.fee_tier ?? attrs.fee ?? null,
+    feePercent,
+    feeTier: Number.isInteger(rawFeeNumber) && rawFeeNumber > 0 ? rawFeeNumber : null,
+    feeSource: feePercent != null ? "geckoterminal" : null,
+    feeRaw: rawFee,
     tvl: num(attrs.reserve_in_usd),
     volume24h: num(attrs.volume_usd?.h24),
     priceUsd: num(attrs.base_token_price_usd),
@@ -816,8 +1251,16 @@ async function resolveBytes32PoolAddress(pool, {
   }
 }
 
-/** Minimal pool record when only on-chain identity is available. */
-function syntheticPool({ address, chainKey, tokens, feePercent }) {
+/** Minimal pool record when only on-chain or indexer identity is available. */
+function syntheticPool({
+  address,
+  chainKey,
+  tokens,
+  feePercent,
+  feeTier = null,
+  tickSpacing = null,
+  feeSource = null,
+}) {
   const chain = POOL_CHAINS[chainKey];
   const metas = tokens.map((token) => ({
     address: token,
@@ -834,7 +1277,10 @@ function syntheticPool({ address, chainKey, tokens, feePercent }) {
     pool: address,
     poolId: address,
     feePercent: feePercent ?? null,
-    feeRaw: null,
+    feeTier: feeTier ?? null,
+    tickSpacing: tickSpacing ?? null,
+    feeSource: feeSource ?? (feePercent != null ? "rpc" : null),
+    feeRaw: feeTier,
     tvl: null,
     volume24h: null,
     priceUsd: null,
@@ -1039,6 +1485,25 @@ export async function analyzePoolAddress({
     pools = dedupePools(pools);
   }
 
+  // Secondary indexer fallback: aggregators often omit Uniswap v3 pools on
+  // newer EVM chains. Query the Pool entity directly when nothing was found.
+  if (pools.length === 0) {
+    for (const chainKey of indexerChainCandidates(config, [])) {
+      const indexed = await fetchIndexerPool(input, {
+        chainKey,
+        config,
+        fetchImpl,
+        timeoutMs,
+      });
+      if (!indexed?.pool || !sameAddress(indexed.pool, input)) continue;
+      const fromIndexer = poolFromIndexer(indexed);
+      if (fromIndexer) {
+        pools = [fromIndexer];
+        break;
+      }
+    }
+  }
+
   const apiRole = detectApiAddressRole(input, pools);
   const detectedChains = pools.length > 0
     ? []
@@ -1121,7 +1586,10 @@ export async function analyzePoolAddress({
           onChainRole.token1,
         );
       }
-      primary.feePercent = primary.feePercent ?? onChainRole?.feePercent ?? null;
+      if (primary.feePercent == null && onChainRole?.feePercent != null) {
+        primary.feePercent = onChainRole.feePercent;
+        primary.feeSource = "rpc";
+      }
     }
   } else {
     // Token address: resolve every pool where token0 == address OR token1 == address.
@@ -1144,15 +1612,32 @@ export async function analyzePoolAddress({
     };
   }
 
-  // Read fee() on-chain for every displayed pool whose API fee is missing.
+  // Fee pipeline: aggregator -> subgraph/indexer -> on-chain fee() RPC.
+  // Enrich every displayed pool that is missing a fee tier or tick spacing.
+  await Promise.all(scopedPools.map(async (pool) => {
+    if (pool.feePercent != null && pool.tickSpacing != null) return;
+    const indexed = await fetchIndexerPool(pool.pool, {
+      chainKey: pool.chain,
+      config,
+      fetchImpl,
+      timeoutMs,
+    });
+    applyIndexerMetadata(pool, indexed);
+  }));
+
+  // Last resort: read fee() on-chain for pools still missing a fee tier.
   await Promise.all(scopedPools.map(async (pool) => {
     if (pool.feePercent == null) {
-      pool.feePercent = await readFeeOnChain(pool, {
+      const rpcFee = await readFeeOnChain(pool, {
         config,
         router,
         enableRpcFallback,
         timeoutMs,
       });
+      if (rpcFee != null) {
+        pool.feePercent = rpcFee;
+        pool.feeSource = "rpc";
+      }
     }
   }));
 
@@ -1237,9 +1722,7 @@ function fmtRatio(value) {
 }
 
 function fmtFee(value) {
-  const number = num(value);
-  if (number == null) return "n/a";
-  return `${Number(number.toFixed(4))}%`;
+  return feeTierLabel(value) || "n/a";
 }
 
 export function formatPoolAnalysis(analysis = {}) {
@@ -1302,9 +1785,14 @@ export function formatPoolAnalysis(analysis = {}) {
     if (dexUrl) links.push(`<a href="${escapeHtmlAttr(dexUrl)}">DEX</a>`);
     links.push(`<a href="${escapeHtmlAttr(explorerUrl({ ...pool, pool: poolAddress }))}">Explorer</a>`);
 
-    lines.push(`${index + 1}. <b>${escapeHtml(pool.pair)}</b> — ${escapeHtml(pool.dex)}`);
+    const tier = feeTierLabel(pool.feePercent);
     lines.push(
-      `   Pool <code>${escapeHtml(poolAddress)}</code> | fee ${fmtFee(pool.feePercent)}`,
+      `${index + 1}. <b>${escapeHtml(pool.pair)}</b> — ${escapeHtml(pool.dex)}`
+      + `${tier ? ` (${tier})` : ""}`,
+    );
+    lines.push(
+      `   Pool <code>${escapeHtml(poolAddress)}</code> | fee ${fmtFee(pool.feePercent)}`
+      + `${pool.tickSpacing != null ? ` | tick ${escapeHtml(pool.tickSpacing)}` : ""}`,
     );
     lines.push(
       `   TVL ${fmtMoney(pool.tvl)} | Vol24h ${fmtMoney(pool.volume24h)} | `

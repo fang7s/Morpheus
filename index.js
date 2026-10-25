@@ -54,6 +54,7 @@ Environment:
   TELEGRAM_ENABLED                  exit/alert notifications
   TELEGRAM_COMMANDS_ENABLED         interactive command menu
   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+  INDEXER_API_URL / SUBGRAPH_URL_<chainId>   pool fee-tier indexer fallback
 `;
 
 function parseArgs(argv) {
@@ -168,6 +169,13 @@ function printCheck(config) {
     `telegram=${config.telegram.enabled ? "alerts-on" : "alerts-off"} `
       + `commands=${config.telegram.commandsEnabled ? "on" : "off"}`,
     `health=${config.health.enabled ? `:${config.health.port}` : "disabled"}`,
+    `indexer=${!config.indexer?.enabled
+      ? "disabled"
+      : config.indexer.url
+        ? `${config.indexer.type} ${config.indexer.url}`
+        : Object.keys(config.indexer.byChain || {}).length
+          ? `${Object.keys(config.indexer.byChain).length} chain endpoint(s)`
+          : "no endpoint configured"}`,
   ];
   for (const line of lines) log("check", line);
   if (config.positions.length === 0 && !config.discovery.enabled) {

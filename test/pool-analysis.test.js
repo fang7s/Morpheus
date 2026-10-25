@@ -2,8 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  UNISWAP_FEE_TIERS,
   analyzePoolAddress,
   buildNarrative,
+  feeTierLabel,
+  fetchIndexerPool,
   formatPoolAnalysis,
   isEvmAddress,
 } from "../tools/pool-analysis.js";
@@ -354,5 +357,278 @@ test("narrative flags honeypots and thin liquidity as high risk", () => {
   assert.match(narrative.reasons.join(" "), /honeypot/i);
   assert.match(narrative.reasons.join(" "), /Top 10/);
   assert.match(narrative.activityNote, /sell-side dominant/);
+});
+
+
+test("maps raw Uniswap v3 fee tiers to canonical percentage labels", () => {
+  assert.deepEqual(UNISWAP_FEE_TIERS, {
+    100: "0.01%",
+    500: "0.05%",
+    3000: "0.3%",
+    10000: "1.0%",
+  });
+  assert.equal(feeTierLabel(100), "0.01%");
+  assert.equal(feeTierLabel(500), "0.05%");
+  assert.equal(feeTierLabel(3000), "0.3%");
+  assert.equal(feeTierLabel(10000), "1.0%");
+  assert.equal(feeTierLabel("500"), "0.05%");
+  assert.equal(feeTierLabel("0.05%"), "0.05%");
+  assert.equal(feeTierLabel(0.0005), "0.05%");
+  assert.equal(feeTierLabel(0.25), "0.25%");
+  assert.equal(feeTierLabel(null), null);
+  assert.equal(feeTierLabel("n/a"), null);
+});
+
+test("resolves a missing fee tier from a subgraph Pool entity", async () => {
+  const pool = "0xd1d2d3d4d5d6d7d8d9daDbDcDdDeDfD0D1D2D3D4";
+  const season = "0xa1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4";
+  const weth = "0xb1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4";
+  const indexerUrl = "https://indexer.example/graphql";
+  let indexerCalls = 0;
+
+  const fetchImpl = async (url, options = {}) => {
+    if (url.includes("dexscreener") && url.includes("/tokens/")) {
+      return response({
+        pairs: [dexPair({
+          chainId: "robinhood",
+          pairAddress: pool,
+          url: "https://dexscreener.com/robinhood/0xd1d2",
+          feeTier: null,
+          fee: null,
+          baseToken: { address: season, name: "Season", symbol: "SEASON" },
+          quoteToken: { address: weth, name: "Wrapped Ether", symbol: "WETH" },
+        })],
+      });
+    }
+    if (url === indexerUrl && options.method === "POST") {
+      indexerCalls += 1;
+      const body = JSON.parse(options.body);
+      assert.match(body.query, /pool\(id: \$id\)/);
+      if (body.variables.id !== pool.toLowerCase()) {
+        return response({ data: { pool: null } });
+      }
+      return response({
+        data: {
+          pool: {
+            id: pool.toLowerCase(),
+            feeTier: "500",
+            tickSpacing: "10",
+            token0: { id: season.toLowerCase(), symbol: "SEASON" },
+            token1: { id: weth.toLowerCase(), symbol: "WETH" },
+          },
+        },
+      });
+    }
+    if (url.includes("goplus")) return response({ result: {} });
+    return response({ pairs: [] });
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: pool,
+    config: {
+      indexer: { url: indexerUrl, type: "subgraph" },
+    },
+    fetchImpl,
+    enableRpcFallback: false,
+  });
+
+  assert.equal(analysis.addressType, "pool");
+  assert.equal(analysis.chain, "robinhood");
+  assert.equal(analysis.primary.feePercent, 0.05);
+  assert.equal(analysis.primary.feeTier, 500);
+  assert.equal(analysis.primary.tickSpacing, 10);
+  assert.equal(analysis.primary.feeSource, "subgraph");
+  assert.ok(indexerCalls >= 1);
+
+  const text = formatPoolAnalysis(analysis);
+  assert.match(text, /SEASON\/WETH<\/b> — Uniswap v3 \(0\.05%\)/);
+  assert.match(text, /fee 0\.05%/);
+  assert.match(text, /tick 10/);
+});
+
+test("queries a Defined.fi style REST indexer for pool metadata", async () => {
+  const pool = "0xe1e2e3e4e5e6e7e8e9eaebecedeeef0011223344";
+  const tokenA = "0x1111111111111111111111111111111111111111";
+  const tokenB = "0x2222222222222222222222222222222222222222";
+  const requests = [];
+
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    return response({
+      data: {
+        pool: {
+          id: pool,
+          fee: "0.3%",
+          tickSpacing: 60,
+          token0: { id: tokenA, symbol: "AAA" },
+          token1: { id: tokenB, symbol: "BBB" },
+        },
+      },
+    });
+  };
+
+  const indexed = await fetchIndexerPool(pool, {
+    chainKey: "base",
+    config: {
+      indexer: { url: "https://api.defined.fi/v1", type: "defined" },
+    },
+    fetchImpl,
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.method, "GET");
+  assert.match(requests[0].url, /\/pools\/0xe1e2/i);
+  assert.equal(indexed.source, "defined");
+  assert.equal(indexed.feePercent, 0.3);
+  assert.equal(indexed.feeTier, null);
+  assert.equal(indexed.tickSpacing, 60);
+  assert.equal(indexed.pair, "AAA/BBB");
+});
+
+
+test("auto-detects an Envio GraphQL endpoint and reads tickSpacing", async () => {
+  const pool = "0xf1f2f3f4f5f6f7f8f9fafbfcfdfeff0011223344";
+  const tokenA = "0x3333333333333333333333333333333333333333";
+  const tokenB = "0x4444444444444444444444444444444444444444";
+
+  const indexed = await fetchIndexerPool(pool, {
+    chainKey: "robinhood",
+    config: {
+      indexer: { url: "https://envio.example/v1/graphql", type: "auto" },
+    },
+    fetchImpl: async (url, options = {}) => {
+      assert.equal(options.method, "POST");
+      return response({
+        data: {
+          pool: {
+            id: pool.toLowerCase(),
+            feeTier: 10000,
+            tickSpacing: 200,
+            token0: { id: tokenA, symbol: "AAA" },
+            token1: { id: tokenB, symbol: "BBB" },
+          },
+        },
+      });
+    },
+  });
+
+  assert.equal(indexed.source, "envio");
+  assert.equal(indexed.chain, "robinhood");
+  assert.equal(indexed.feePercent, 1);
+  assert.equal(indexed.feeTier, 10000);
+  assert.equal(indexed.tickSpacing, 200);
+  assert.equal(feeTierLabel(indexed.feePercent), "1.0%");
+});
+
+test("fee pipeline prefers the indexer over the on-chain fee() RPC", async () => {
+  const pool = "0x5555555555555555555555555555555555555555";
+  const token = "0x6666666666666666666666666666666666666666";
+  const quote = "0x7777777777777777777777777777777777777777";
+  const indexerUrl = "https://indexer.example/graphql";
+  const rpcCalls = [];
+
+  const fetchImpl = async (url, options = {}) => {
+    if (url.includes("dexscreener") && url.includes("/tokens/")) {
+      return response({
+        pairs: [dexPair({
+          pairAddress: pool,
+          feeTier: null,
+          fee: null,
+          baseToken: { address: token, name: "Morpheus", symbol: "MORPH" },
+          quoteToken: { address: quote, name: "USD Coin", symbol: "USDC" },
+        })],
+      });
+    }
+    if (url === indexerUrl && options.method === "POST") {
+      return response({
+        data: {
+          pool: {
+            id: pool.toLowerCase(),
+            feeTier: 3000,
+            tickSpacing: 60,
+            token0: { id: token, symbol: "MORPH" },
+            token1: { id: quote, symbol: "USDC" },
+          },
+        },
+      });
+    }
+    if (url.includes("goplus")) return response({ result: {} });
+    return response({ pairs: [] });
+  };
+  const router = {
+    get: () => ({
+      getPoolState: async () => {
+        rpcCalls.push("getPoolState");
+        return { fee: 100 };
+      },
+    }),
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: token,
+    config: {
+      rpcByChain: { base: ["https://base.example"] },
+      indexer: { url: indexerUrl, type: "subgraph" },
+    },
+    router,
+    fetchImpl,
+    enableRpcFallback: true,
+  });
+
+  assert.equal(analysis.primary.feePercent, 0.3);
+  assert.equal(analysis.primary.tickSpacing, 60);
+  assert.equal(analysis.primary.feeSource, "subgraph");
+  assert.equal(rpcCalls.length, 0, "indexer result must short-circuit the RPC fallback");
+});
+
+test("falls back to on-chain fee() when the indexer has no pool", async () => {
+  const pool = "0x8888888888888888888888888888888888888888";
+  const token = "0x9999999999999999999999999999999999999999";
+  const quote = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const indexerUrl = "https://indexer.example/graphql";
+  const rpcCalls = [];
+
+  const fetchImpl = async (url, options = {}) => {
+    if (url.includes("dexscreener") && url.includes("/tokens/")) {
+      return response({
+        pairs: [dexPair({
+          pairAddress: pool,
+          feeTier: null,
+          fee: null,
+          baseToken: { address: token, name: "Morpheus", symbol: "MORPH" },
+          quoteToken: { address: quote, name: "USD Coin", symbol: "USDC" },
+        })],
+      });
+    }
+    if (url === indexerUrl && options.method === "POST") {
+      return response({ data: { pool: null } });
+    }
+    if (url.includes("goplus")) return response({ result: {} });
+    return response({ pairs: [] });
+  };
+  const router = {
+    get: () => ({
+      getPoolState: async () => {
+        rpcCalls.push("getPoolState");
+        return { fee: 10000 };
+      },
+    }),
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: token,
+    config: {
+      rpcByChain: { base: ["https://base.example"] },
+      indexer: { url: indexerUrl, type: "graphql" },
+    },
+    router,
+    fetchImpl,
+    enableRpcFallback: true,
+  });
+
+  assert.equal(analysis.primary.feePercent, 1);
+  assert.equal(analysis.primary.feeSource, "rpc");
+  assert.deepEqual(rpcCalls, ["getPoolState"]);
+  assert.match(formatPoolAnalysis(analysis), /fee 1\.0%/);
 });
 

@@ -170,6 +170,9 @@ export const RPC_ENV_PREFIXES = {
   arbitrum: ["ARBITRUM", "ARB"],
 };
 
+/** Indexer protocol types accepted by tools/pool-analysis.js. */
+const INDEXER_TYPES = new Set(["auto", "graphql", "subgraph", "envio", "defined", "rest"]);
+
 const DEFAULTS = {
   chain: "arbitrum",
   rpcUrl: "",
@@ -224,6 +227,15 @@ const DEFAULTS = {
   },
   health: { enabled: false, port: 3010 },
   telegram: { enabled: false, botToken: "", chatId: "" },
+  indexer: {
+    enabled: true,
+    url: "",
+    type: "auto",
+    apiKey: "",
+    chain: "",
+    timeoutMs: 8_000,
+    byChain: {},
+  },
 };
 
 function isPlainObject(value) {
@@ -301,6 +313,43 @@ function buildRpcByChain(defaultChain, merged) {
       ...(isDefault ? userRpcUrls : []),
       ...chain.rpcUrls,
     ])];
+  }
+  return map;
+}
+
+/**
+ * Resolve the optional pool-metadata indexer URL per chain.
+ * Order: SUBGRAPH_URL_<chainId> / INDEXER_API_URL_<chainId> / <PREFIX>_SUBGRAPH_URL
+ * from .env, then user-config indexer.byChain.
+ */
+function buildIndexerByChain(merged) {
+  const configured = isPlainObject(merged?.indexer?.byChain)
+    ? merged.indexer.byChain
+    : {};
+  const map = {};
+
+  for (const chain of Object.values(CHAINS)) {
+    const prefixes = RPC_ENV_PREFIXES[chain.key] || [chain.key.toUpperCase()];
+    const envUrls = [
+      process.env[`SUBGRAPH_URL_${chain.chainId}`],
+      process.env[`INDEXER_API_URL_${chain.chainId}`],
+      ...prefixes.flatMap((prefix) => [
+        process.env[`${prefix}_SUBGRAPH_URL`],
+        process.env[`${prefix}_INDEXER_URL`],
+      ]),
+    ].map((url) => String(url || "").trim()).filter(Boolean);
+    const url = envUrls[0] || String(configured[chain.key] || "").trim();
+    if (url) map[chain.key] = url;
+  }
+
+  // Accept numeric chain ids (or aliases) as user-config byChain keys.
+  for (const [key, value] of Object.entries(configured)) {
+    const chain = CHAINS[key] || Object.values(CHAINS).find(
+      (entry) => String(entry.chainId) === String(key)
+        || (Array.isArray(entry.aliases) && entry.aliases.includes(key)),
+    );
+    const url = String(value || "").trim();
+    if (chain && url && !map[chain.key]) map[chain.key] = url;
   }
   return map;
 }
@@ -410,6 +459,20 @@ function validate(config, { allowEmptyPositions = false } = {}) {
   if (!Array.isArray(config.rpcUrls) || config.rpcUrls.length === 0) {
     errors.push("no active RPC URL configured");
   }
+  if (config.indexer?.url && !/^https?:\/\//i.test(config.indexer.url)) {
+    config.indexer.url = "";
+    config.warnings.push(
+      "INDEXER_API_URL is not an http(s) URL — generic indexer fallback ignored.",
+    );
+  }
+  for (const [chainKey, url] of Object.entries(config.indexer?.byChain || {})) {
+    if (!/^https?:\/\//i.test(url || "")) {
+      delete config.indexer.byChain[chainKey];
+      config.warnings.push(
+        `indexer URL for ${chainKey} is not an http(s) URL — ignored.`,
+      );
+    }
+  }
   if (!/^\d+[mh]$/i.test(String(config.panda.timeframe))) {
     errors.push('panda.timeframe must look like "5m" or "1h"');
   }
@@ -509,6 +572,39 @@ export function loadConfig(options = {}) {
   const rpcByChain = buildRpcByChain(chain, merged);
   const rpcUrls = rpcByChain[chain.key];
 
+  // Optional secondary indexer/subgraph used by /pool to recover exact
+  // Uniswap v3 fee tiers that DexScreener/GeckoTerminal leave as "n/a".
+  const indexerType = String(
+    process.env.INDEXER_API_TYPE || merged.indexer?.type || "auto",
+  ).trim().toLowerCase();
+  if (!INDEXER_TYPES.has(indexerType)) {
+    warnings.push(
+      `indexer.type "${indexerType}" is invalid — using "auto". `
+      + `Supported: ${[...INDEXER_TYPES].join(", ")}.`,
+    );
+  }
+  const indexer = {
+    ...merged.indexer,
+    enabled: asBool(process.env.INDEXER_ENABLED ?? merged.indexer?.enabled, true),
+    url: String(process.env.INDEXER_API_URL || merged.indexer?.url || "").trim(),
+    type: INDEXER_TYPES.has(indexerType) ? indexerType : "auto",
+    apiKey: String(
+      process.env.INDEXER_API_KEY || merged.indexer?.apiKey || "",
+    ).trim(),
+    chain: String(
+      process.env.INDEXER_CHAIN
+      || process.env.INDEXER_CHAIN_ID
+      || merged.indexer?.chain
+      || "",
+    ).trim(),
+    timeoutMs: positiveInt(
+      process.env.INDEXER_TIMEOUT_MS ?? merged.indexer?.timeoutMs,
+      8_000,
+      500,
+    ),
+    byChain: buildIndexerByChain(merged),
+  };
+
   const config = {
     ...merged,
     chain: chain.key,
@@ -520,6 +616,7 @@ export function loadConfig(options = {}) {
     rpcUrl: rpcUrls[0],
     rpcUrls,
     rpcByChain,
+    indexer,
     privateKey: String(
       process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || merged.privateKey || "",
     ).trim(),
