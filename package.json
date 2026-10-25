@@ -10,8 +10,8 @@
     "once": "node index.js --once",
     "check": "node index.js --check",
     "test": "npm run test:syntax && npm run test:unit",
-    "test:syntax": "node --check config.js && node --check logger.js && node --check index.js && node --check tools/evil-panda.js && node --check tools/uniswap-v3.js",
-    "test:unit": "node --test test/evil-panda.test.js test/chains.test.js"
+    "test:syntax": "node --check config.js && node --check logger.js && node --check index.js && node --check tools/evil-panda.js && node --check tools/uniswap-v3.js && node --check tools/position-key.js && node --check tools/telegram-commands.js",
+    "test:unit": "node --test test/evil-panda.test.js test/chains.test.js test/telegram-commands.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

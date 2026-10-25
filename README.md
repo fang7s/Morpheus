@@ -65,6 +65,23 @@ At inspection time Morpheus resolves the position's target chain and chain ID,
 then lazily creates a client bound to that chain's `.env` RPC route. Positions
 without `chain`/`chainId` inherit `CHAIN`.
 
+## Telegram Command Menu
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`, then start the bot.
+The menu uses non-blocking long polling and accepts commands only from the
+configured chat ID.
+
+| Command | Description |
+| --- | --- |
+| `/start`, `/help` | Command list and bot status |
+| `/wallet` | Wallet address, native ETH/BNB balances, per-chain RPC status |
+| `/positions` | Open LP positions, chain, pool/ticks, entry and active price |
+| `/history` | Last 10 closed positions with timestamp and close reason |
+| `/pnl` | Closed-trade count and estimated realized PnL |
+
+`TELEGRAM_ENABLED` controls exit/alert notifications independently.
+`TELEGRAM_COMMANDS_ENABLED=false` disables the command menu.
+
 ## Scripts
 
 | Command | Description |

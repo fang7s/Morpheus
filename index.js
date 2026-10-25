@@ -8,6 +8,11 @@ import express from "express";
 import { chainInfo, chainRuntimeConfig, loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { UniswapV3 } from "./tools/uniswap-v3.js";
+import { positionKey } from "./tools/position-key.js";
+import {
+  notifyTelegram,
+  startTelegramCommandPoller,
+} from "./tools/telegram-commands.js";
 import {
   checkEvilPandaExitConfluence,
   clearPriceSeriesCaches,
@@ -41,7 +46,9 @@ Environment:
   WALLET_PRIVATE_KEY                 required for live trading (PRIVATE_KEY alias)
   PORT / HEALTH_ENABLED              local health endpoint
   POLL_INTERVAL_MS / LOG_LEVEL
-  TELEGRAM_ENABLED / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+  TELEGRAM_ENABLED                  exit/alert notifications
+  TELEGRAM_COMMANDS_ENABLED         interactive command menu
+  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 `;
 
 function parseArgs(argv) {
@@ -128,6 +135,7 @@ function printBanner(config) {
   log("startup", `Exit engine: ${describeExitEngine(config.panda)}`);
   log("startup", `Poll interval: ${config.pollIntervalMs}ms`);
   log("startup", `Positions configured: ${config.positions.length} | discovery: ${config.discovery.enabled ? "on" : "off"}`);
+  log("startup", `Telegram commands: ${config.telegram.commandsEnabled ? "on" : "off"}`);
   log("startup", `Config file: ${config.configPath || "(none — defaults + .env)"}`);
   for (const warning of config.warnings || []) log("startup_warn", warning);
   log("startup", "────────────────────────────────────────────────────────");
@@ -151,7 +159,8 @@ function printCheck(config) {
       ? ` [${config.positions.map((p) => p.label).join(", ")}]`
       : ""}`,
     `discovery=${config.discovery.enabled ? config.discovery.wallet : "disabled"}`,
-    `telegram=${config.telegram.enabled ? "enabled" : "disabled"}`,
+    `telegram=${config.telegram.enabled ? "alerts-on" : "alerts-off"} `
+      + `commands=${config.telegram.commandsEnabled ? "on" : "off"}`,
     `health=${config.health.enabled ? `:${config.health.port}` : "disabled"}`,
   ];
   for (const line of lines) log("check", line);
@@ -162,11 +171,6 @@ function printCheck(config) {
     );
   }
   log("check", "Configuration OK.");
-}
-
-function positionKey(position) {
-  return `${position.chain || "unknown"}:${position.pool.toLowerCase()}:`
-    + `${position.tokenId || position.label}`;
 }
 
 /**
@@ -295,37 +299,41 @@ async function evaluatePosition(config, client, position) {
   return { series, result, baseToken };
 }
 
-async function notifyTelegram(config, text) {
-  if (!config.telegram.enabled) return;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8_000);
-  try {
-    const res = await fetch(
-      `https://api.telegram.org/bot${config.telegram.botToken}/sendMessage`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: config.telegram.chatId,
-          text,
-          disable_web_page_preview: true,
-        }),
-        signal: controller.signal,
-      },
-    );
-    if (!res.ok) throw new Error(`Telegram HTTP ${res.status}`);
-  } catch (error) {
-    log("panda_warn", `Telegram alert failed: ${error.message}`);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 /** Dry-run exits are logged only; live exits call the NPM. */
-async function handleExit({ config, client, position, evaluation, signalReason }) {
-  const priceText = evaluation.series.currentPrice != null
-    ? ` price=${evaluation.series.currentPrice}`
-    : "";
+async function handleExit({
+  config,
+  client,
+  position,
+  evaluation,
+  signalReason,
+  entryPrice,
+  amountUsd,
+}) {
+  const exitPrice = evaluation.series.currentPrice;
+  const entry = Number(entryPrice);
+  const amount = Number(amountUsd);
+  const pnlPct = Number.isFinite(entry) && entry > 0 && Number.isFinite(exitPrice)
+    ? ((exitPrice / entry) - 1) * 100
+    : null;
+  const pnlUsd = pnlPct != null && Number.isFinite(amount) && amount > 0
+    ? amount * (pnlPct / 100)
+    : null;
+  const state = position.state || {};
+  const meta = {
+    label: position.label,
+    pair: `${state.token0Symbol || position.token0 || "?"}/`
+      + `${state.token1Symbol || position.token1 || "?"}`,
+    chain: position.chain,
+    chainId: position.chainId,
+    entryPrice: Number.isFinite(entry) && entry > 0 ? entry : null,
+    exitPrice: Number.isFinite(exitPrice) ? exitPrice : null,
+    amountUsd: Number.isFinite(amount) && amount > 0 ? amount : null,
+    pnlPct,
+    pnlUsd,
+    at: new Date().toISOString(),
+  };
+
+  const priceText = exitPrice != null ? ` price=${exitPrice}` : "";
   const base = `[${position.label}] ${signalReason}${priceText} `
     + `[${evaluation.series.source}, ${evaluation.series.prices.length} samples, ${evaluation.series.timeframe}]`;
 
@@ -338,13 +346,11 @@ async function handleExit({ config, client, position, evaluation, signalReason }
     return {
       shadow: true,
       reason: signalReason,
-      chain: position.chain,
-      chainId: position.chainId,
+      ...meta,
       pool: position.pool,
       tokenId: position.tokenId,
-      price: evaluation.series.currentPrice,
+      price: exitPrice,
       source: evaluation.series.source,
-      at: new Date().toISOString(),
     };
   }
 
@@ -354,7 +360,7 @@ async function handleExit({ config, client, position, evaluation, signalReason }
     config,
     `Morpheus EVM LIVE exit\n${base}\ntx=${result.txHashes.join(", ")}`,
   );
-  return result;
+  return { ...result, ...meta };
 }
 
 /** One evaluation pass over all resolved positions. */
@@ -372,7 +378,12 @@ async function runCycle(ctx) {
 
     for (const position of positions) {
       const key = positionKey(position);
-      const tracked = runtime.tracked.get(key) || { exited: false, last: null };
+      const tracked = runtime.tracked.get(key) || {
+        exited: false,
+        last: null,
+        entryPrice: null,
+        entryAt: null,
+      };
       if (tracked.exited) continue;
 
       try {
@@ -380,6 +391,13 @@ async function runCycle(ctx) {
         const evaluation = await evaluatePosition(config, client, position);
         const { series, result } = evaluation;
         const sampleCount = series.prices?.length || 0;
+
+        if (tracked.entryPrice == null
+          && Number.isFinite(series.currentPrice)
+          && series.currentPrice > 0) {
+          tracked.entryPrice = series.currentPrice;
+          tracked.entryAt = new Date().toISOString();
+        }
 
         if (sampleCount < config.panda.minCandles) {
           log(
@@ -435,9 +453,14 @@ async function runCycle(ctx) {
             position,
             evaluation,
             signalReason: result.reason,
+            entryPrice: tracked.entryPrice,
+            amountUsd: position.amountUsd,
           });
           tracked.exited = true;
           runtime.exits.push(tracked.exit);
+          if (runtime.exits.length > 200) {
+            runtime.exits.splice(0, runtime.exits.length - 200);
+          }
           confirmation.reset(key);
           log("panda", `[${position.label}] exit confirmed after ${confirm.required} ticks.`);
         }
@@ -563,6 +586,7 @@ async function main() {
 
   const server = config.health.enabled ? startHealthServer(ctx) : null;
   let timer = null;
+  let telegramCommands = null;
   let shuttingDown = false;
 
   async function shutdown(reason, exitProcess = true) {
@@ -574,6 +598,7 @@ async function main() {
       await new Promise((resolve) => server.close(resolve));
       log("shutdown", "Health server closed.");
     }
+    telegramCommands?.stop();
     router.destroy();
     log("shutdown", "Stopped.");
     if (exitProcess) process.exit(0);
@@ -596,6 +621,7 @@ async function main() {
   }
 
   await runCycle(ctx);
+  telegramCommands = startTelegramCommandPoller(ctx);
   timer = setInterval(() => {
     runCycle(ctx).catch((error) => {
       log("error", `Cycle error: ${error.message}`);

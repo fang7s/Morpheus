@@ -27,6 +27,7 @@ export const CHAINS = {
     geckoNetwork: "arbitrum",
     dexscreenerChain: "arbitrum",
     explorer: "https://arbiscan.io",
+    nativeSymbol: "ETH",
     wrappedNative: "WETH",
     aliases: ["arb", "arbitrum-one"],
     factory: "0x1F98431c8aD98523631AE4a59f267346ea31F984",
@@ -54,6 +55,7 @@ export const CHAINS = {
     geckoNetwork: "base",
     dexscreenerChain: "base",
     explorer: "https://basescan.org",
+    nativeSymbol: "ETH",
     wrappedNative: "WETH",
     aliases: ["base-mainnet"],
     factory: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
@@ -81,6 +83,7 @@ export const CHAINS = {
     geckoNetwork: "eth",
     dexscreenerChain: "ethereum",
     explorer: "https://etherscan.io",
+    nativeSymbol: "ETH",
     wrappedNative: "WETH",
     aliases: ["eth", "mainnet", "ethereum-mainnet"],
     factory: "0x1F98431c8aD98523631AE4a59f267346ea31F984",
@@ -110,6 +113,7 @@ export const CHAINS = {
     geckoNetwork: "bsc",
     dexscreenerChain: "bsc",
     explorer: "https://bscscan.com",
+    nativeSymbol: "BNB",
     wrappedNative: "WBNB",
     aliases: ["bsc", "binance", "bnb-chain", "bnb-smart-chain"],
     factory: "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
@@ -138,6 +142,7 @@ export const CHAINS = {
     geckoNetwork: "robinhood",
     dexscreenerChain: "robinhood",
     explorer: "https://robinhoodchain.blockscout.com",
+    nativeSymbol: "ETH",
     wrappedNative: "WETH",
     aliases: ["robinhood-chain", "orbit", "rhc"],
     factory: "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
@@ -577,6 +582,10 @@ export function loadConfig(options = {}) {
     },
     telegram: {
       enabled: asBool(process.env.TELEGRAM_ENABLED ?? merged.telegram.enabled, false),
+      commandsEnabled: asBool(
+        process.env.TELEGRAM_COMMANDS_ENABLED ?? merged.telegram.commandsEnabled,
+        true,
+      ),
       botToken: String(process.env.TELEGRAM_BOT_TOKEN || merged.telegram.botToken || "").trim(),
       chatId: String(process.env.TELEGRAM_CHAT_ID || merged.telegram.chatId || "").trim(),
     },
@@ -584,7 +593,10 @@ export function loadConfig(options = {}) {
     warnings,
   };
 
-  if (!config.telegram.botToken || !config.telegram.chatId) config.telegram.enabled = false;
+  if (!config.telegram.botToken || !config.telegram.chatId) {
+    config.telegram.enabled = false;
+    config.telegram.commandsEnabled = false;
+  }
 
   return validate(config, {
     allowEmptyPositions: options.allowEmptyPositions === true
