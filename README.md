@@ -82,8 +82,13 @@ configured chat ID.
 | `/start`, `/help` | Command list and bot status |
 | `/wallet` | Wallet address, native ETH/BNB balances, per-chain RPC status, discovered LP count |
 | `/positions` | Open LP positions, chain, pool/ticks, entry and active price; refreshes wallet discovery |
+| `/pool <address>` | Multi-chain token/pool analysis: DEX pools, TVL, volume, prices, holders and risk narrative |
 | `/history` | Last 10 closed positions with timestamp and close reason |
 | `/pnl` | Closed-trade count and estimated realized PnL |
+
+`/pool` discovers tokens and pools on Arbitrum, Base, BNB Chain, Ethereum,
+Polygon, Avalanche, Optimism and Robinhood Chain through DexScreener,
+GeckoTerminal, GoPlus and on-chain fee reads.
 
 `TELEGRAM_ENABLED` controls exit/alert notifications independently.
 `TELEGRAM_COMMANDS_ENABLED=false` disables the command menu.

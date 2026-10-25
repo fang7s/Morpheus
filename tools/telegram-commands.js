@@ -6,7 +6,11 @@ import { Wallet, formatEther } from "ethers";
 import { chainInfo } from "../config.js";
 import { log } from "../logger.js";
 import { discoverWalletPositions, mergePositions } from "./discovery.js";
+import { escapeHtml } from "./html.js";
+import { analyzePoolAddress, formatPoolAnalysis } from "./pool-analysis.js";
 import { positionKey } from "./position-key.js";
+
+export { escapeHtml };
 
 const MAX_MESSAGE_LENGTH = 3_900;
 const DEFAULT_HISTORY_LIMIT = 10;
@@ -19,14 +23,6 @@ function delay(ms) {
 function shortAddress(value) {
   const address = String(value || "");
   return address.length > 12 ? `${address.slice(0, 6)}…${address.slice(-4)}` : address;
-}
-
-/** Escape dynamic values before sending Telegram parse_mode=HTML messages. */
-export function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
 }
 
 function finiteNumber(value) {
@@ -85,6 +81,12 @@ export function parseTelegramCommand(text) {
   return command || null;
 }
 
+/** Everything after the command token, preserving argument order. */
+export function parseTelegramArguments(text) {
+  const parts = String(text || "").trim().split(/\s+/).filter(Boolean);
+  return parts.slice(1);
+}
+
 /** Exact chat-ID allow-list check. An empty allow-list rejects everyone. */
 export function isAuthorizedChat(chatId, allowedChatId) {
   const allowed = String(allowedChatId ?? "").trim();
@@ -139,6 +141,7 @@ export function formatHelp(config, runtime = {}) {
     "<code>/start</code> or <code>/help</code> — this menu and bot status",
     "<code>/wallet</code> — wallet address, native balance, RPC status",
     "<code>/positions</code> — open LP positions and wallet discovery",
+    "<code>/pool &lt;address&gt;</code> — multi-chain token/pool analysis",
     "<code>/history</code> — last 10 closed positions",
     "<code>/pnl</code> — realized PnL estimate",
     "",
@@ -309,11 +312,26 @@ export async function formatWallet({ config, router }) {
   return lines.join("\n");
 }
 
-export async function handleTelegramCommand(command, ctx) {
+export async function handleTelegramCommand(command, ctx, args = []) {
   switch (command) {
     case "start":
     case "help":
       return formatHelp(ctx.config, ctx.runtime);
+    case "pool": {
+      const address = args[0];
+      if (!address) {
+        return "<b>Pool Analysis</b>\nUsage: "
+          + "<code>/pool &lt;token_or_pool_address&gt;</code>";
+      }
+      const analysis = await analyzePoolAddress({
+        address,
+        config: ctx.config,
+        router: ctx.router,
+        fetchImpl: ctx.fetchImpl,
+        enableRpcFallback: ctx.enableRpcFallback !== false,
+      });
+      return formatPoolAnalysis(analysis);
+    }
     case "wallet":
       return formatWallet(ctx);
     case "positions": {
@@ -414,6 +432,7 @@ export const BOT_COMMANDS = [
   { command: "help", description: "Show command menu and status" },
   { command: "wallet", description: "Wallet, balances and RPC status" },
   { command: "positions", description: "Open LP positions and wallet discovery" },
+  { command: "pool", description: "Analyze a token or pool across chains" },
   { command: "history", description: "Last closed LP positions" },
   { command: "pnl", description: "Realized PnL estimate" },
 ];
@@ -496,8 +515,9 @@ export function startTelegramCommandPoller(ctx, options = {}) {
 
           const command = parseTelegramCommand(message.text);
           if (!command) continue;
+          const args = parseTelegramArguments(message.text);
           try {
-            const reply = await handleTelegramCommand(command, ctx);
+            const reply = await handleTelegramCommand(command, ctx, args);
             await send(reply || "No data available.");
           } catch (error) {
             const reason = error?.message || String(error);

@@ -14,6 +14,7 @@ import {
   formatWallet,
   handleTelegramCommand,
   isAuthorizedChat,
+  parseTelegramArguments,
   parseTelegramCommand,
   sendTelegramMessage,
   startTelegramCommandPoller,
@@ -108,9 +109,14 @@ function sampleRuntime(position) {
 
 test("registers the expected Telegram command menu", () => {
   const commands = BOT_COMMANDS.map((entry) => entry.command);
-  for (const expected of ["start", "help", "wallet", "positions", "history", "pnl"]) {
+  for (const expected of ["start", "help", "wallet", "positions", "pool", "history", "pnl"]) {
     assert.ok(commands.includes(expected), `missing /${expected}`);
   }
+});
+
+test("parses command arguments after the command token", () => {
+  assert.deepEqual(parseTelegramArguments("/pool 0xabc extra"), ["0xabc", "extra"]);
+  assert.deepEqual(parseTelegramArguments("no-command"), []);
 });
 
 test("parses commands with bot suffix and ignores plain text", () => {
@@ -141,6 +147,7 @@ test("help text includes status and every command", () => {
   assert.match(text, /Chain: <code>base<\/code>/);
   assert.match(text, /\/wallet/);
   assert.match(text, /\/positions/);
+  assert.match(text, /\/pool/);
   assert.match(text, /\/history/);
   assert.match(text, /\/pnl/);
 });
@@ -224,6 +231,59 @@ test("HTML parse errors retry as plain text instead of failing silently", async 
   assert.equal(calls.length, 2);
   assert.equal(calls[0].parse_mode, "HTML");
   assert.equal(calls[1].parse_mode, undefined);
+});
+
+test("/pool resolves and renders a multi-chain token report", async () => {
+  const token = "0x1212121212121212121212121212121212121212";
+  const pool = "0x3434343434343434343434343434343434343434";
+  const quote = "0x5656565656565656565656565656565656565656";
+  const fetchImpl = async (url) => {
+    if (url.includes("dexscreener") && url.includes("/tokens/")) {
+      return {
+        ok: true,
+        json: async () => ({
+          pairs: [{
+            chainId: "base",
+            dexId: "uniswap",
+            url: "https://dexscreener.com/base/0x3434",
+            pairAddress: pool,
+            feeTier: 500,
+            baseToken: { address: token, name: "Morpheus", symbol: "MORPH" },
+            quoteToken: { address: quote, name: "USD Coin", symbol: "USDC" },
+            priceUsd: "0.5",
+            txns: { h24: { buys: 500, sells: 500 } },
+            volume: { h24: 1_000_000 },
+            priceChange: { h24: 5 },
+            liquidity: { usd: 500_000 },
+            fdv: 20_000_000,
+            marketCap: 15_000_000,
+          }],
+        }),
+      };
+    }
+    if (url.includes("goplus")) return { ok: true, json: async () => ({ result: {} }) };
+    return { ok: true, json: async () => ({ pairs: [] }) };
+  };
+  const ctx = {
+    config: baseConfig({ rpcByChain: { base: ["https://base.example"] } }),
+    router: {},
+    fetchImpl,
+    enableRpcFallback: false,
+    runtime: {},
+  };
+
+  const text = await handleTelegramCommand("pool", ctx, [token]);
+  assert.match(text, /<b>Pool &amp; Token Analysis<\/b>/);
+  assert.match(text, /<b>MORPH\/USDC<\/b>/);
+  assert.match(text, /fee 0\.05%/);
+  assert.match(text, /Vol\/TVL 200\.0%/);
+  assert.match(text, /Narrative/);
+  assert.match(text, /Risk: <b>/);
+
+  const usage = await handleTelegramCommand("pool", ctx, []);
+  assert.match(usage, /Usage:/);
+  const invalid = await handleTelegramCommand("pool", ctx, ["0xnope"]);
+  assert.match(invalid, /Invalid EVM contract address/);
 });
 
 test("poller ignores unauthorized chats and stops cleanly", async () => {
