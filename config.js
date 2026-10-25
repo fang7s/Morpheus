@@ -208,7 +208,7 @@ const DEFAULTS = {
   },
   positions: [],
   discovery: {
-    enabled: false,
+    enabled: true,
     wallet: "",
     maxPositions: 10,
   },
@@ -428,8 +428,12 @@ function validate(config, { allowEmptyPositions = false } = {}) {
   if (!allowEmptyPositions && config.positions.length === 0 && !config.discovery.enabled) {
     errors.push("no positions configured and discovery is disabled");
   }
-  if (config.discovery.enabled && !ADDRESS_RE.test(config.discovery.wallet || "")) {
-    errors.push("discovery.enabled requires a valid discovery.wallet address");
+  if (config.discovery.enabled
+    && !ADDRESS_RE.test(config.discovery.wallet || "")
+    && !PRIVATE_KEY_RE.test(config.privateKey || "")) {
+    config.warnings.push(
+      "discovery is enabled but no discovery wallet or private key is configured yet",
+    );
   }
   if (!config.dryRun) {
     if (!PRIVATE_KEY_RE.test(config.privateKey || "")) {
@@ -558,9 +562,18 @@ export function loadConfig(options = {}) {
     positions: normalizePositions(merged.positions, chain),
     discovery: {
       ...merged.discovery,
-      enabled: asBool(merged.discovery.enabled, false),
-      wallet: String(merged.discovery.wallet || "").trim(),
-      maxPositions: positiveInt(merged.discovery.maxPositions, 10, 1),
+      enabled: asBool(process.env.DISCOVERY_ENABLED ?? merged.discovery.enabled, true),
+      wallet: String(
+        process.env.DISCOVERY_WALLET
+        || process.env.WALLET_ADDRESS
+        || merged.discovery.wallet
+        || "",
+      ).trim(),
+      maxPositions: positiveInt(
+        process.env.DISCOVERY_MAX_POSITIONS ?? merged.discovery.maxPositions,
+        10,
+        1,
+      ),
     },
     risk: {
       stopLossPct: Number(merged.risk.stopLossPct ?? -50),

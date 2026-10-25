@@ -8,6 +8,11 @@ import express from "express";
 import { chainInfo, chainRuntimeConfig, loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { UniswapV3 } from "./tools/uniswap-v3.js";
+import {
+  clearDiscoveryCache,
+  configuredWallet,
+  discoverWalletPositions,
+} from "./tools/discovery.js";
 import { positionKey } from "./tools/position-key.js";
 import {
   notifyTelegram,
@@ -158,7 +163,8 @@ function printCheck(config) {
     `positions=${config.positions.length}${config.positions.length
       ? ` [${config.positions.map((p) => p.label).join(", ")}]`
       : ""}`,
-    `discovery=${config.discovery.enabled ? config.discovery.wallet : "disabled"}`,
+    `discovery=${config.discovery.enabled
+      ? (config.discovery.wallet || configuredWallet(config) || "enabled") : "disabled"}`,
     `telegram=${config.telegram.enabled ? "alerts-on" : "alerts-off"} `
       + `commands=${config.telegram.commandsEnabled ? "on" : "off"}`,
     `health=${config.health.enabled ? `:${config.health.port}` : "disabled"}`,
@@ -239,36 +245,21 @@ async function resolvePositions(config, router) {
   }
 
   if (config.discovery.enabled) {
-    const discoveryClient = router.get(config.chain);
-    const owner = discoveryClient.walletAddress || config.discovery.wallet;
-    if (!owner) {
-      log("panda_warn", "Discovery is enabled but no wallet address is available.");
+    const discovery = await discoverWalletPositions({
+      config,
+      router,
+      limit: config.discovery.maxPositions,
+      refresh: true,
+    });
+    if (!discovery.wallet) {
+      log("startup_warn", "Discovery is enabled but no wallet address is available yet.");
     } else {
-      try {
-        const walletPositions = await discoveryClient.getWalletPositions(owner, {
-          limit: config.discovery.maxPositions,
-        });
-        for (const onchain of walletPositions) {
-          const baseToken = await discoveryClient.resolveBaseToken(onchain.pool, null);
-          add({
-            label: `wallet-${onchain.tokenId}`,
-            chain: config.chain,
-            chainId: config.chainId,
-            pool: onchain.pool,
-            tokenId: onchain.tokenId,
-            token0: onchain.token0,
-            token1: onchain.token1,
-            baseToken,
-            fee: onchain.fee,
-            amountUsd: null,
-            notes: "discovered on-chain",
-            onchain,
-          });
-        }
-        log("startup", `Discovered ${walletPositions.length} wallet position(s) for ${shortAddress(owner)}`);
-      } catch (error) {
-        log("panda_warn", `Wallet position discovery failed: ${error.message}`);
-      }
+      for (const position of discovery.positions) add(position);
+      log(
+        "startup",
+        `Discovered ${discovery.positions.length} wallet position(s) across `
+        + `${discovery.chains.length} chain(s) for ${shortAddress(discovery.wallet)}`,
+      );
     }
   }
 
@@ -560,11 +551,9 @@ async function main() {
   if (positions.length === 0) {
     log(
       "startup_warn",
-      "No positions resolved. Add positions to user-config.json, or enable discovery with a wallet address.",
+      "No explicit or discovered positions yet. Continuing startup; Telegram "
+      + "/positions and /wallet will retry wallet discovery on demand.",
     );
-    router.destroy();
-    process.exitCode = 1;
-    return;
   }
 
   const ctx = {
@@ -599,6 +588,7 @@ async function main() {
       log("shutdown", "Health server closed.");
     }
     telegramCommands?.stop();
+    clearDiscoveryCache();
     router.destroy();
     log("shutdown", "Stopped.");
     if (exitProcess) process.exit(0);

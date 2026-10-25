@@ -45,9 +45,10 @@
   ],
 
   "discovery": {
-    "enabled": false,
+    "enabled": true,
     "wallet": "",
-    "maxPositions": 10
+    "maxPositions": 10,
+    "_comment": "When enabled, positions are discovered from the wallet on every configured chain. The wallet defaults to the address derived from WALLET_PRIVATE_KEY."
   },
 
   "exit": {

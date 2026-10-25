@@ -195,6 +195,23 @@ test("DRY_RUN takes precedence over SHADOW_MODE and warns on conflict", () => {
   });
 });
 
+test("empty positions are allowed when wallet discovery is enabled", () => {
+  withEnv({ DISCOVERY_ENABLED: null, DISCOVERY_WALLET: null }, () => {
+    const config = loadConfig({ allowEmptyPositions: false });
+    assert.equal(config.positions.length, 0);
+    assert.equal(config.discovery.enabled, true);
+  });
+});
+
+test("empty positions still fail when discovery is explicitly disabled", () => {
+  withEnv({ DISCOVERY_ENABLED: "false", DISCOVERY_WALLET: null }, () => {
+    assert.throws(
+      () => loadConfig({ allowEmptyPositions: false }),
+      /no positions configured and discovery is disabled/,
+    );
+  });
+});
+
 function ADDRESS(value) {
   try {
     getAddress(value);

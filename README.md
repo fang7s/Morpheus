@@ -65,6 +65,12 @@ At inspection time Morpheus resolves the position's target chain and chain ID,
 then lazily creates a client bound to that chain's `.env` RPC route. Positions
 without `chain`/`chainId` inherit `CHAIN`.
 
+Wallet LP auto-discovery is enabled by default (`DISCOVERY_ENABLED=true`). If
+`user-config.json` contains no positions, Morpheus scans every configured chain
+for NFT positions owned by the discovery wallet (or the address derived from
+`WALLET_PRIVATE_KEY`). `/positions` and `/wallet` refresh this discovery on
+demand, so an empty config no longer blocks startup.
+
 ## Telegram Command Menu
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`, then start the bot.
@@ -74,8 +80,8 @@ configured chat ID.
 | Command | Description |
 | --- | --- |
 | `/start`, `/help` | Command list and bot status |
-| `/wallet` | Wallet address, native ETH/BNB balances, per-chain RPC status |
-| `/positions` | Open LP positions, chain, pool/ticks, entry and active price |
+| `/wallet` | Wallet address, native ETH/BNB balances, per-chain RPC status, discovered LP count |
+| `/positions` | Open LP positions, chain, pool/ticks, entry and active price; refreshes wallet discovery |
 | `/history` | Last 10 closed positions with timestamp and close reason |
 | `/pnl` | Closed-trade count and estimated realized PnL |
 

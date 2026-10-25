@@ -198,7 +198,15 @@ export class UniswapV3 {
     this.signer = !config.dryRun && config.privateKey
       ? new Wallet(config.privateKey, this.provider)
       : null;
-    this.walletAddress = this.signer?.address || config.discovery?.wallet || null;
+    let derivedWallet = null;
+    if (config.privateKey) {
+      try {
+        derivedWallet = new Wallet(config.privateKey).address;
+      } catch {
+        // Invalid keys are reported by config validation in live mode.
+      }
+    }
+    this.walletAddress = this.signer?.address || config.discovery?.wallet || derivedWallet || null;
 
     this.factory = new Contract(config.factory, FACTORY_ABI, this.provider);
     this.npm = new Contract(

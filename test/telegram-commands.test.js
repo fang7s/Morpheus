@@ -1,14 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { clearDiscoveryCache } from "../tools/discovery.js";
 import { positionKey } from "../tools/position-key.js";
 import {
+  BOT_COMMANDS,
   chunkMessage,
+  escapeHtml,
   formatHelp,
   formatHistory,
   formatPnl,
   formatPositions,
   formatWallet,
+  handleTelegramCommand,
   isAuthorizedChat,
   parseTelegramCommand,
   sendTelegramMessage,
@@ -102,6 +106,13 @@ function sampleRuntime(position) {
   };
 }
 
+test("registers the expected Telegram command menu", () => {
+  const commands = BOT_COMMANDS.map((entry) => entry.command);
+  for (const expected of ["start", "help", "wallet", "positions", "history", "pnl"]) {
+    assert.ok(commands.includes(expected), `missing /${expected}`);
+  }
+});
+
 test("parses commands with bot suffix and ignores plain text", () => {
   assert.equal(parseTelegramCommand("/positions@MorpheusBot now"), "positions");
   assert.equal(parseTelegramCommand("  /PNL  "), "pnl");
@@ -127,7 +138,7 @@ test("help text includes status and every command", () => {
   const text = formatHelp(baseConfig(), { startedAtMs: Date.now() - 60_000, polls: 2, errors: 0 });
   assert.match(text, /Morpheus EVM LP Agent/);
   assert.match(text, /SHADOW \/ DRY-RUN/);
-  assert.match(text, /Chain: base/);
+  assert.match(text, /Chain: <code>base<\/code>/);
   assert.match(text, /\/wallet/);
   assert.match(text, /\/positions/);
   assert.match(text, /\/history/);
@@ -192,8 +203,27 @@ test("sendTelegramMessage splits long replies and targets the configured chat", 
   assert.equal(calls.length, 2);
   for (const call of calls) {
     assert.equal(call.chat_id, "42");
+    assert.equal(call.parse_mode, "HTML");
     assert.ok(call.text.length <= 3_900);
   }
+});
+
+test("HTML parse errors retry as plain text instead of failing silently", async () => {
+  const calls = [];
+  const fetchImpl = async (_url, options) => {
+    calls.push(JSON.parse(options.body));
+    if (calls.length === 1) {
+      return {
+        ok: false,
+        json: async () => ({ ok: false, description: "Bad Request: can't parse entities" }),
+      };
+    }
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+  await sendTelegramMessage(baseConfig(), "<b>status</b>", fetchImpl);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].parse_mode, "HTML");
+  assert.equal(calls[1].parse_mode, undefined);
 });
 
 test("poller ignores unauthorized chats and stops cleanly", async () => {
@@ -233,6 +263,7 @@ test("poller ignores unauthorized chats and stops cleanly", async () => {
     pollIntervalMs: 1,
     retryDelayMs: 1,
     timeoutSec: 1,
+    registerCommands: false,
   });
   assert.ok(poller);
 
@@ -249,6 +280,85 @@ test("poller ignores unauthorized chats and stops cleanly", async () => {
   poller.stop();
   await poller.done;
   assert.equal(poller.stopped, true);
+});
+
+test("positions command merges on-demand wallet discovery", async () => {
+  clearDiscoveryCache();
+  const discovered = {
+    label: "wallet-9",
+    chain: "bnb",
+    chainId: 56,
+    pool: "0x5555555555555555555555555555555555555555",
+    token0: "0x6666666666666666666666666666666666666666",
+    token1: "0x7777777777777777777777777777777777777777",
+    state: { token0Symbol: "WBNB", token1Symbol: "USDT" },
+    onchain: { tickLower: -60, tickUpper: 60 },
+    fee: 100,
+    tokenId: "9",
+  };
+  const ctx = {
+    config: {
+      ...baseConfig({
+        discovery: { enabled: true, wallet: WALLET, maxPositions: 5 },
+        rpcByChain: { bnb: ["https://bsc.example"] },
+      }),
+    },
+    router: {
+      get: () => ({
+        getWalletPositions: async () => [{
+          tokenId: discovered.tokenId,
+          pool: discovered.pool,
+          token0: discovered.token0,
+          token1: discovered.token1,
+          token0Symbol: "WBNB",
+          token1Symbol: "USDT",
+          fee: discovered.fee,
+          tickLower: -60,
+          tickUpper: 60,
+        }],
+        resolveBaseToken: async () => discovered.token1,
+      }),
+    },
+    positions: [],
+    runtime: { tracked: new Map(), exits: [] },
+  };
+
+  const text = await handleTelegramCommand("positions", ctx);
+  assert.match(text, /WBNB\/USDT \[bnb\]/);
+  assert.match(text, /Wallet discovery: 1 position\(s\)/);
+  assert.match(text, /ticks -60 → 60/);
+});
+
+test("HTML replies escape dynamic values", () => {
+  assert.equal(escapeHtml("<b>&</b>"), "&lt;b&gt;&amp;&lt;/b&gt;");
+});
+
+test("wallet command lists discovered LP positions", async () => {
+  clearDiscoveryCache();
+  const router = {
+    get: () => ({
+      provider: {
+        getBlockNumber: async () => 1,
+        getBalance: async () => 0n,
+      },
+      getWalletPositions: async () => [{
+        tokenId: "3",
+        pool: "0x8888888888888888888888888888888888888888",
+        token0: "0x9999999999999999999999999999999999999999",
+        token1: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        token0Symbol: "WETH",
+        token1Symbol: "USDC",
+        fee: 500,
+      }],
+      resolveBaseToken: async () => "0x9999999999999999999999999999999999999999",
+    }),
+  };
+  const config = baseConfig({
+    discovery: { enabled: true, wallet: WALLET, maxPositions: 5 },
+  });
+  const text = await formatWallet({ config, router });
+  assert.match(text, /Discovered LP positions:<\/b> 1/);
+  assert.match(text, /WETH\/USDC \[base\]/);
 });
 
 test("poller stays disabled without credentials or when commands are off", () => {
