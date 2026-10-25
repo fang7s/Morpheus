@@ -24,43 +24,6 @@ npm run check
 npm start
 ```
 
-## Multi-Chain RPC Configuration
-
-Set any or all chains in `.env`. Use `_RPC_URL` for a single endpoint or
-`_RPC_URLS` for a comma-separated fallback list:
-
-```dotenv
-ETH_RPC_URLS=https://ethereum-rpc.publicnode.com,https://eth.llamarpc.com
-BSC_RPC_URL=https://bsc-rpc.publicnode.com
-BASE_RPC_URLS=https://mainnet.base.org,https://base.llamarpc.com
-ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com
-ARBITRUM_RPC_URL=https://arb1.arbitrum.io/rpc
-```
-
-`CHAIN` sets the default chain. A position can override it with `chain` or a
-numeric `chainId`:
-
-```json
-{
-  "positions": [
-    {
-      "label": "WETH/USDC 0.05%",
-      "chain": "ethereum",
-      "token0": "WETH",
-      "token1": "USDC",
-      "fee": 500
-    },
-    {
-      "label": "WBNB/USDT 0.1%",
-      "chainId": 56,
-      "token0": "WBNB",
-      "token1": "USDT",
-      "fee": 100
-    }
-  ]
-}
-```
-
 At inspection time Morpheus resolves the position's target chain and chain ID,
 then lazily creates a client bound to that chain's `.env` RPC route. Positions
 without `chain`/`chainId` inherit `CHAIN`.
