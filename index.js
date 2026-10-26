@@ -14,6 +14,7 @@ import {
   discoverWalletPositions,
 } from "./tools/discovery.js";
 import { positionKey } from "./tools/position-key.js";
+import { monitorAutomations, closeAutomationByTokenId, automationFilePath } from "./tools/position-manager.js";
 import {
   notifyTelegram,
   startTelegramCommandPoller,
@@ -54,6 +55,9 @@ Environment:
   TELEGRAM_ENABLED                  exit/alert notifications
   TELEGRAM_COMMANDS_ENABLED         interactive command menu
   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+  MAX_GAS_FEE_USD                   /deploy gas guardrail (default 0.50)
+  DEPLOY_AMOUNT_USD                 /deploy deposit budget (default 100)
+  DEPLOY_MAX_TAX_PCT                max buy/sell tax (default 1)
   INDEXER_API_URL / SUBGRAPH_URL_<chainId>   pool fee-tier indexer fallback
 `;
 
@@ -161,6 +165,8 @@ function printCheck(config) {
     `factory=${config.factory}`,
     `panda=${describeExitEngine(config.panda)}`,
     `priceFeed=buffer:${config.priceFeed.bufferSize} geckoCooldown:${config.priceFeed.geckoCooldownMs}ms`,
+    `deploy=maxGas:${config.deploy?.maxGasFeeUsd} maxTax:${config.deploy?.maxTaxPct}% `
+      + `budget:$${config.deploy?.amountUsd}`,
     `positions=${config.positions.length}${config.positions.length
       ? ` [${config.positions.map((p) => p.label).join(", ")}]`
       : ""}`,
@@ -355,6 +361,11 @@ async function handleExit({
 
   log("panda_exit", `[LIVE] ${base} | closing position ${position.tokenId}`);
   const result = await client.closePosition(position.tokenId, config.exit);
+  closeAutomationByTokenId(
+    position.tokenId,
+    { closeReason: signalReason, closeTxHashes: result.txHashes || [] },
+    { filePath: automationFilePath(config) },
+  );
   await notifyTelegram(
     config,
     `Morpheus EVM LIVE exit\n${base}\ntx=${result.txHashes.join(", ")}`,
@@ -370,6 +381,17 @@ async function runCycle(ctx) {
   runtime.polls += 1;
 
   try {
+    // Enforce /deploy position automations before the Evil Panda pass. This
+    // runs even when no static positions are configured.
+    try {
+      await monitorAutomations(ctx, {
+        notify: (text) => notifyTelegram(config, text),
+      });
+    } catch (error) {
+      runtime.errors += 1;
+      log("panda_warn", `Automation monitor failed: ${error.message}`);
+    }
+
     if (positions.length === 0) {
       log("panda_warn", "No positions resolved; nothing to monitor this cycle.");
       return;

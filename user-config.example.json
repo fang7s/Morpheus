@@ -62,6 +62,23 @@
     "takeProfitPct": 25
   },
 
+  "deploy": {
+    "maxGasFeeUsd": 0.5,
+    "maxTaxPct": 1,
+    "amountUsd": 100,
+    "minAmountUsd": 1,
+    "slippageBps": 100,
+    "deadlineSec": 1200,
+    "securityTimeoutMs": 8000,
+    "priceTimeoutMs": 8000,
+    "gasLimitEstimate": 450000,
+    "approveGasLimitEstimate": 60000,
+    "nativeUsdPrice": 0,
+    "allowUnverified": false,
+    "automationsPath": "",
+    "_comment": "Used only by the user-triggered /deploy flow. MAX_GAS_FEE_USD, DEPLOY_MAX_TAX_PCT, DEPLOY_AMOUNT_USD and DEPLOY_ALLOW_UNVERIFIED in .env override these values."
+  },
+
   "health": {
     "enabled": false,
     "port": 3010

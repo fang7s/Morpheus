@@ -13,6 +13,7 @@ user-config.json
 logs/
 *.log
 npm-debug.log*
+active-automations.json
 
 # Test / build output
 coverage/

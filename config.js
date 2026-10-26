@@ -225,6 +225,22 @@ const DEFAULTS = {
     slippageBps: 100,
     deadlineSec: 1_200,
   },
+  deploy: {
+    // Pre-execution guardrails for the user-triggered /deploy flow.
+    maxGasFeeUsd: 0.5,
+    maxTaxPct: 1,
+    amountUsd: 100,
+    minAmountUsd: 1,
+    slippageBps: 100,
+    deadlineSec: 1_200,
+    securityTimeoutMs: 8_000,
+    priceTimeoutMs: 8_000,
+    gasLimitEstimate: 450_000,
+    approveGasLimitEstimate: 60_000,
+    nativeUsdPrice: 0,
+    allowUnverified: false,
+    automationsPath: "",
+  },
   health: { enabled: false, port: 3010 },
   telegram: { enabled: false, botToken: "", chatId: "" },
   indexer: {
@@ -271,6 +287,11 @@ function asBool(value, fallback) {
 function positiveInt(value, fallback, min = 1) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= min ? Math.floor(parsed) : fallback;
+}
+
+function positiveNumber(value, fallback, min = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
 }
 
 /** Split a comma/whitespace-separated RPC list into trimmed, non-empty URLs. */
@@ -681,6 +702,71 @@ export function loadConfig(options = {}) {
       burnAfterExit: asBool(merged.exit.burnAfterExit, true),
       slippageBps: positiveInt(merged.exit.slippageBps, 100, 0),
       deadlineSec: positiveInt(merged.exit.deadlineSec, 1_200, 60),
+    },
+    deploy: {
+      ...merged.deploy,
+      maxGasFeeUsd: positiveNumber(
+        process.env.MAX_GAS_FEE_USD ?? merged.deploy.maxGasFeeUsd,
+        0.5,
+        0,
+      ),
+      maxTaxPct: positiveNumber(
+        process.env.DEPLOY_MAX_TAX_PCT ?? merged.deploy.maxTaxPct,
+        1,
+        0,
+      ),
+      amountUsd: positiveNumber(
+        process.env.DEPLOY_AMOUNT_USD ?? merged.deploy.amountUsd,
+        100,
+        1,
+      ),
+      minAmountUsd: positiveNumber(
+        process.env.DEPLOY_MIN_AMOUNT_USD ?? merged.deploy.minAmountUsd,
+        1,
+        0,
+      ),
+      slippageBps: positiveInt(
+        process.env.DEPLOY_SLIPPAGE_BPS ?? merged.deploy.slippageBps,
+        100,
+        0,
+      ),
+      deadlineSec: positiveInt(
+        process.env.DEPLOY_DEADLINE_SEC ?? merged.deploy.deadlineSec,
+        1_200,
+        60,
+      ),
+      securityTimeoutMs: positiveInt(
+        process.env.DEPLOY_SECURITY_TIMEOUT_MS ?? merged.deploy.securityTimeoutMs,
+        8_000,
+        1_000,
+      ),
+      priceTimeoutMs: positiveInt(
+        process.env.DEPLOY_PRICE_TIMEOUT_MS ?? merged.deploy.priceTimeoutMs,
+        8_000,
+        1_000,
+      ),
+      gasLimitEstimate: positiveInt(
+        process.env.DEPLOY_GAS_LIMIT_ESTIMATE ?? merged.deploy.gasLimitEstimate,
+        450_000,
+        21_000,
+      ),
+      approveGasLimitEstimate: positiveInt(
+        process.env.DEPLOY_APPROVE_GAS_LIMIT_ESTIMATE ?? merged.deploy.approveGasLimitEstimate,
+        60_000,
+        21_000,
+      ),
+      nativeUsdPrice: positiveNumber(
+        process.env.NATIVE_USD_PRICE ?? merged.deploy.nativeUsdPrice,
+        0,
+        0,
+      ),
+      allowUnverified: asBool(
+        process.env.DEPLOY_ALLOW_UNVERIFIED ?? merged.deploy.allowUnverified,
+        false,
+      ),
+      automationsPath: String(
+        process.env.ACTIVE_AUTOMATIONS_PATH || merged.deploy.automationsPath || "",
+      ).trim(),
     },
     health: {
       enabled: asBool(process.env.HEALTH_ENABLED ?? merged.health.enabled, false),

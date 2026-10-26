@@ -9,6 +9,12 @@ import { discoverWalletPositions, mergePositions } from "./discovery.js";
 import { escapeHtml } from "./html.js";
 import { analyzePoolAddress, formatPoolAnalysis } from "./pool-analysis.js";
 import { positionKey } from "./position-key.js";
+import {
+  clearDeploySessions,
+  handleDeployCallback,
+  startDeployment,
+} from "./deploy.js";
+import { handleManagementCallback } from "./position-manager.js";
 
 export { escapeHtml };
 
@@ -141,6 +147,7 @@ export function formatHelp(config, runtime = {}) {
     "<code>/start</code> or <code>/help</code> — this menu and bot status",
     "<code>/wallet</code> — wallet address, native balance, RPC status",
     "<code>/positions</code> — open LP positions and wallet discovery",
+    "<code>/deploy &lt;token_address&gt;</code> — guardrailed LP deployment menu",
     "<code>/pool &lt;address&gt;</code> — multi-chain token/pool analysis",
     "<code>/history</code> — last 10 closed positions",
     "<code>/pnl</code> — realized PnL estimate",
@@ -332,6 +339,8 @@ export async function handleTelegramCommand(command, ctx, args = []) {
       });
       return formatPoolAnalysis(analysis);
     }
+    case "deploy":
+      return startDeployment(ctx, args, { fetchImpl: ctx.fetchImpl });
     case "wallet":
       return formatWallet(ctx);
     case "positions": {
@@ -372,13 +381,13 @@ export async function sendTelegramMessage(
   config,
   text,
   fetchImpl = globalThis.fetch,
-  { parseMode = "HTML" } = {},
+  { parseMode = "HTML", replyMarkup = null } = {},
 ) {
   const token = config?.telegram?.botToken;
   const chatId = config?.telegram?.chatId;
   if (!token || !chatId) throw new Error("Telegram bot token/chat ID is not configured");
 
-  async function postChunk(chunk, mode) {
+  async function postChunk(chunk, mode, markup) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8_000);
     try {
@@ -390,6 +399,7 @@ export async function sendTelegramMessage(
           text: chunk,
           disable_web_page_preview: true,
           ...(mode ? { parse_mode: mode } : {}),
+          ...(markup ? { reply_markup: markup } : {}),
         }),
         signal: controller.signal,
       });
@@ -402,19 +412,84 @@ export async function sendTelegramMessage(
     }
   }
 
-  for (const chunk of chunkMessage(text)) {
+  const chunks = chunkMessage(text);
+  for (let index = 0; index < chunks.length; index++) {
+    const chunk = chunks[index];
     try {
-      await postChunk(chunk, parseMode);
+      await postChunk(chunk, parseMode, index === 0 ? replyMarkup : null);
     } catch (error) {
       const message = error?.message || String(error);
       if (parseMode && /parse|entit|bad request/i.test(message)) {
         log("telegram_warn", `HTML reply rejected (${message}); retrying as plain text`);
-        await postChunk(chunk, null);
+        await postChunk(chunk, null, index === 0 ? replyMarkup : null);
       } else {
         throw error;
       }
     }
   }
+}
+
+/** Edit an inline-menu message in place (used by /deploy callbacks). */
+export async function editTelegramMessage(
+  config,
+  chatId,
+  messageId,
+  text,
+  fetchImpl = globalThis.fetch,
+  { parseMode = "HTML", replyMarkup = null } = {},
+) {
+  const token = config?.telegram?.botToken;
+  if (!token || !chatId || !messageId) return false;
+  const body = {
+    chat_id: chatId,
+    message_id: messageId,
+    text: String(text ?? "").slice(0, MAX_MESSAGE_LENGTH),
+    disable_web_page_preview: true,
+    ...(parseMode ? { parse_mode: parseMode } : {}),
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+  };
+  const response = await fetchImpl(`https://api.telegram.org/bot${token}/editMessageText`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || payload?.ok === false) {
+    throw new Error(payload?.description || `Telegram HTTP ${response.status}`);
+  }
+  return true;
+}
+
+/** Acknowledge a callback query so Telegram stops the button spinner. */
+export async function answerCallbackQuery(
+  config,
+  callbackQueryId,
+  text = null,
+  fetchImpl = globalThis.fetch,
+) {
+  const token = config?.telegram?.botToken;
+  if (!token || !callbackQueryId) return false;
+  try {
+    const response = await fetchImpl(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        callback_query_id: callbackQueryId,
+        ...(text ? { text: String(text).slice(0, 190) } : {}),
+      }),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Route inline-menu callbacks for deployment and position management. */
+export async function handleTelegramCallback(ctx, callbackQuery = {}) {
+  const data = String(callbackQuery?.data || "");
+  if (data.startsWith("dp:")) return handleDeployCallback(ctx, data, callbackQuery);
+  if (data.startsWith("mgr:")) return handleManagementCallback(ctx, data, callbackQuery);
+  return { text: "This menu is no longer active.", replyMarkup: null, edit: true };
 }
 
 /** Exit alerts remain gated by TELEGRAM_ENABLED; commands do not use this. */
@@ -432,6 +507,7 @@ export const BOT_COMMANDS = [
   { command: "help", description: "Show command menu and status" },
   { command: "wallet", description: "Wallet, balances and RPC status" },
   { command: "positions", description: "Open LP positions and wallet discovery" },
+  { command: "deploy", description: "Guardrailed LP deployment with inline menus" },
   { command: "pool", description: "Analyze a token or pool across chains" },
   { command: "history", description: "Last closed LP positions" },
   { command: "pnl", description: "Realized PnL estimate" },
@@ -462,7 +538,12 @@ export function startTelegramCommandPoller(ctx, options = {}) {
   }
 
   const fetchImpl = options.fetchImpl || globalThis.fetch;
-  const send = options.send || ((text) => sendTelegramMessage(ctx.config, text, fetchImpl));
+  const send = options.send || ((text, extra = {}) => sendTelegramMessage(
+    ctx.config,
+    text,
+    fetchImpl,
+    { replyMarkup: extra.replyMarkup || null },
+  ));
   const timeoutSec = options.timeoutSec ?? 25;
   const retryDelayMs = options.retryDelayMs ?? 3_000;
   const pollIntervalMs = options.pollIntervalMs ?? 250;
@@ -486,7 +567,7 @@ export function startTelegramCommandPoller(ctx, options = {}) {
       try {
         const params = new URLSearchParams({
           timeout: String(timeoutSec),
-          allowed_updates: JSON.stringify(["message"]),
+          allowed_updates: JSON.stringify(["message", "callback_query"]),
         });
         if (offset) params.set("offset", String(offset));
 
@@ -503,7 +584,39 @@ export function startTelegramCommandPoller(ctx, options = {}) {
           if (update.update_id != null) offset = Number(update.update_id) + 1;
 
           const message = update.message || update.edited_message;
-          if (!message?.text) continue;
+          if (!message?.text) {
+            const callbackQuery = update.callback_query;
+            if (!callbackQuery) continue;
+            const chatId = callbackQuery.message?.chat?.id ?? callbackQuery.from?.id;
+            if (!isAuthorizedChat(chatId, telegram.chatId)) {
+              if (!unauthorizedWarned) {
+                unauthorizedWarned = true;
+                log("telegram_warn", `Ignored callback from unauthorized chat ${chatId}`);
+              }
+              continue;
+            }
+            await answerCallbackQuery(ctx.config, callbackQuery.id, null, fetchImpl);
+            try {
+              const reply = await handleTelegramCallback(ctx, callbackQuery);
+              if (reply?.edit && callbackQuery.message?.message_id) {
+                await editTelegramMessage(
+                  ctx.config,
+                  chatId,
+                  callbackQuery.message.message_id,
+                  reply.text || "Updated.",
+                  fetchImpl,
+                  { replyMarkup: reply.replyMarkup || null },
+                );
+              } else if (reply) {
+                await send(reply.text || "Updated.", { replyMarkup: reply.replyMarkup || null });
+              }
+            } catch (error) {
+              const reason = error?.message || String(error);
+              log("telegram_warn", `Callback failed: ${reason}`);
+              await send(`Callback failed: ${escapeHtml(reason)}`).catch(() => {});
+            }
+            continue;
+          }
           const chatId = message.chat?.id;
           if (!isAuthorizedChat(chatId, telegram.chatId)) {
             if (!unauthorizedWarned) {
@@ -518,7 +631,13 @@ export function startTelegramCommandPoller(ctx, options = {}) {
           const args = parseTelegramArguments(message.text);
           try {
             const reply = await handleTelegramCommand(command, ctx, args);
-            await send(reply || "No data available.");
+            if (reply && typeof reply === "object") {
+              await send(reply.text || "No data available.", {
+                replyMarkup: reply.replyMarkup || null,
+              });
+            } else {
+              await send(reply || "No data available.");
+            }
           } catch (error) {
             const reason = error?.message || String(error);
             log("telegram_warn", `Command /${command} failed: ${reason}`);
@@ -541,6 +660,7 @@ export function startTelegramCommandPoller(ctx, options = {}) {
   return {
     stop() {
       stopped = true;
+      clearDeploySessions();
       try {
         controller?.abort();
       } catch {

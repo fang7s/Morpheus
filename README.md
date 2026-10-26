@@ -45,6 +45,7 @@ configured chat ID.
 | `/start`, `/help` | Command list and bot status |
 | `/wallet` | Wallet address, native ETH/BNB balances, per-chain RPC status, discovered LP count |
 | `/positions` | Open LP positions, chain, pool/ticks, entry and active price; refreshes wallet discovery |
+| `/deploy <token_address>` | User-triggered LP deployment with pre-flight guardrails and inline side/range/confirm menus |
 | `/pool <address>` | Multi-chain token/pool analysis: auto-detects TOKEN vs POOL, resolves all pools, top-3 TVL detail, GoPlus safety and risk narrative |
 | `/history` | Last 10 closed positions with timestamp and close reason |
 | `/pnl` | Closed-trade count and estimated realized PnL |
@@ -73,6 +74,45 @@ The resolved tier is shown directly in the report, e.g.
 
 `TELEGRAM_ENABLED` controls exit/alert notifications independently.
 `TELEGRAM_COMMANDS_ENABLED=false` disables the command menu.
+
+## User-Triggered `/deploy`
+
+The bot is never allowed to scan and buy on its own. A deployment starts only
+when the authorized chat sends `/deploy <token_address>`.
+
+**Pre-flight guardrails (run before any menu is shown):**
+
+1. **Token safety** — GoPlus is queried for honeypot, transferability and
+   buy/sell tax. The flow aborts on a honeypot, disabled transfers, a
+   `cannot_sell_all` flag, or tax above `DEPLOY_MAX_TAX_PCT` (default `1%`).
+   Missing safety data fails closed unless `DEPLOY_ALLOW_UNVERIFIED=true`.
+2. **Gas ceiling** — the RPC fee data plus a conservative mint/approve gas
+   estimate is converted to USD using DexScreener native pricing (or
+   `NATIVE_USD_PRICE`). The flow aborts above `MAX_GAS_FEE_USD` (default
+   `$0.50`) and checks the native balance can cover the fee.
+3. **Pool, balance & allowance** — the deepest Uniswap v3 pool against a known
+   quote token is resolved on-chain, balances are read, and the exact ERC20
+   allowance for the NonfungiblePositionManager is inspected. Missing approvals
+   are sent automatically only after the user confirms the mint.
+
+**Inline menu:**
+
+1. Side: `Single-Side Base` · `Single-Side Quote` · `Dual 50:50`
+2. Range: `Narrow ±2%` · `Moderate ±5%` · `Wide ±15%`
+3. Confirmation card with estimated deposits, lower/upper prices and ticks,
+   approvals, gas cost and a `🚀 Confirm & Mint` button. Confirmation signs and
+   broadcasts `mint()` with `WALLET_PRIVATE_KEY` (live mode only).
+
+Single-side ranges are anchored above/below spot so only the selected token is
+deposited. The USD budget comes from `DEPLOY_AMOUNT_USD` (default `$100`) and is
+capped by wallet balances.
+
+**Post-deployment management:**
+
+After minting, the management card exposes alert interval (`5m` / `15m` / `30m`
+/ `Off`), take-profit and stop-loss presets, an auto-close-out-of-range toggle,
+and `Close Position Now`. Settings persist in `active-automations.json` and are
+enforced every monitoring cycle (price-based TP/SL, OOR close, interval alerts).
 
 ## Scripts
 
