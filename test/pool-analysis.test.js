@@ -647,6 +647,54 @@ test("token screening fills feeTier from the subgraph when DexScreener only retu
   assert.match(formatPoolAnalysis(analysis), /fee 0\.3%/);
 });
 
+test("formats fee from feePercent, feeTier or fee without rendering n/a", () => {
+  const poolBase = {
+    chain: "robinhood",
+    pair: "SEASON/WETH",
+    dex: "Uniswap v3",
+    dexId: "uniswap",
+    tvl: 100_000,
+    volume24h: 10_000,
+    tickSpacing: 60,
+  };
+  const text = formatPoolAnalysis({
+    address: "0x1234567890abcdef1234567890abcdef12345678",
+    addressType: "token",
+    chainName: "Robinhood Chain",
+    chainId: 4663,
+    token: {
+      address: "0x1234567890abcdef1234567890abcdef12345678",
+      symbol: "SEASON",
+      name: "Season",
+    },
+    pools: [
+      {
+        ...poolBase,
+        pool: "0x1111111111111111111111111111111111111111",
+        feeTier: 500,
+      },
+      {
+        ...poolBase,
+        pool: "0x2222222222222222222222222222222222222222",
+        fee: 10_000,
+      },
+      {
+        ...poolBase,
+        pool: "0x3333333333333333333333333333333333333333",
+        feePercent: 0.3,
+      },
+    ],
+  });
+
+  assert.match(text, /SEASON\/WETH<\/b> — Uniswap v3 \(0\.05%\)/);
+  assert.match(text, /fee 0\.05%/);
+  assert.match(text, /Uniswap v3 \(1\.0%\)/);
+  assert.match(text, /fee 1\.0%/);
+  assert.match(text, /Uniswap v3 \(0\.3%\)/);
+  assert.match(text, /fee 0\.3%/);
+  assert.doesNotMatch(text, /fee n\/a/);
+});
+
 test("resolves a direct Robinhood pool address from the subgraph when aggregators return nothing", async () => {
   const pool = "0xaaaaaaaabbbbbbbbccccccccddddddddeeeeeeee";
   const token0 = "0x1234567890abcdef1234567890abcdef12345678";

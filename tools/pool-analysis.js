@@ -331,13 +331,30 @@ function feeTierForPercent(percent) {
  */
 function finalizeFeeMetadata(pool) {
   if (!pool) return pool;
-  if (pool.feeTier == null) {
-    const derived = feeTierForPercent(pool.feePercent);
-    if (derived != null) pool.feeTier = derived;
+  const candidates = [
+    pool.feePercent,
+    pool.feeTier,
+    pool.feeRaw,
+    pool.fee,
+    pool.fee_tier,
+  ];
+  let feeTier = pool.feeTier;
+  let feePercent = pool.feePercent;
+  for (const candidate of candidates) {
+    if (candidate == null || candidate === "") continue;
+    if (feePercent == null) {
+      const parsed = feeFromRaw(candidate);
+      if (parsed != null) feePercent = parsed;
+    }
+    if (feeTier == null) {
+      const value = Number(candidate);
+      if (Number.isInteger(value) && value > 0 && value <= 1_000_000) feeTier = value;
+    }
   }
-  if (pool.feePercent == null && pool.feeTier != null) {
-    pool.feePercent = feeFromRaw(pool.feeTier);
-  }
+  if (feeTier == null) feeTier = feeTierForPercent(feePercent);
+  if (feePercent == null && feeTier != null) feePercent = feeFromRaw(feeTier);
+  pool.feeTier = feeTier ?? null;
+  pool.feePercent = feePercent ?? null;
   if (pool.tickSpacing == null && pool.feeTier != null) {
     pool.tickSpacing = FEE_TIER_TICK_SPACING[pool.feeTier] ?? null;
   }
@@ -1902,8 +1919,40 @@ function fmtRatio(value) {
   return number == null ? "n/a" : `${number.toFixed(1)}%`;
 }
 
-function fmtFee(value) {
-  return feeTierLabel(value) || "n/a";
+/**
+ * Fee values arrive under several keys depending on the source:
+ * DexScreener/Gecko use `feePercent`, Subgraph/RPC use `feeTier`/`fee`, and
+ * some adapters keep the original in `feeRaw`. Resolve the first displayable
+ * value instead of trusting a single property.
+ */
+function poolFeeValue(pool) {
+  if (!pool || typeof pool !== "object") return null;
+  const candidates = [
+    pool.feePercent,
+    pool.feeTier,
+    pool.feeRaw,
+    pool.fee,
+    pool.fee_tier,
+    pool.feeSource,
+  ];
+  for (const candidate of candidates) {
+    if (candidate == null || candidate === "") continue;
+    if (feeTierLabel(candidate) != null) return candidate;
+  }
+  return null;
+}
+
+/** Render a pool's fee from any supported property, or `null` when unknown. */
+function poolFeeLabel(pool) {
+  const value = poolFeeValue(pool);
+  return value == null ? null : feeTierLabel(value);
+}
+
+function fmtFee(poolOrValue) {
+  if (poolOrValue && typeof poolOrValue === "object") {
+    return poolFeeLabel(poolOrValue) || "n/a";
+  }
+  return feeTierLabel(poolOrValue) || "n/a";
 }
 
 export function formatPoolAnalysis(analysis = {}) {
@@ -1966,13 +2015,13 @@ export function formatPoolAnalysis(analysis = {}) {
     if (dexUrl) links.push(`<a href="${escapeHtmlAttr(dexUrl)}">DEX</a>`);
     links.push(`<a href="${escapeHtmlAttr(explorerUrl({ ...pool, pool: poolAddress }))}">Explorer</a>`);
 
-    const tier = feeTierLabel(pool.feePercent);
+    const tier = poolFeeLabel(pool);
     lines.push(
       `${index + 1}. <b>${escapeHtml(pool.pair)}</b> — ${escapeHtml(pool.dex)}`
       + `${tier ? ` (${tier})` : ""}`,
     );
     lines.push(
-      `   Pool <code>${escapeHtml(poolAddress)}</code> | fee ${fmtFee(pool.feePercent)}`
+      `   Pool <code>${escapeHtml(poolAddress)}</code> | fee ${fmtFee(pool)}`
       + `${pool.tickSpacing != null ? ` | tick ${escapeHtml(pool.tickSpacing)}` : ""}`,
     );
     const onChainBits = [];
