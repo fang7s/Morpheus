@@ -576,9 +576,75 @@ test("fee pipeline prefers the indexer over the on-chain fee() RPC", async () =>
   });
 
   assert.equal(analysis.primary.feePercent, 0.3);
+  assert.equal(analysis.primary.feeTier, 3000);
   assert.equal(analysis.primary.tickSpacing, 60);
   assert.equal(analysis.primary.feeSource, "subgraph");
   assert.equal(rpcCalls.length, 0, "indexer result must short-circuit the RPC fallback");
+});
+
+test("token screening fills feeTier from the subgraph when DexScreener only returns a percentage", async () => {
+  const pool = "0xabababababababababababababababababababab";
+  const token = "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+  const quote = "0xefefefefefefefefefefefefefefefefefefefef";
+  const indexerUrl = "https://indexer.example/graphql";
+  const rpcCalls = [];
+
+  const fetchImpl = async (url, options = {}) => {
+    if (url.includes("dexscreener") && url.includes("/tokens/")) {
+      return response({
+        pairs: [dexPair({
+          chainId: "robinhood",
+          pairAddress: pool,
+          feeTier: null,
+          fee: "0.3%",
+          baseToken: { address: token, name: "Season", symbol: "SEASON" },
+          quoteToken: { address: quote, name: "Wrapped Ether", symbol: "WETH" },
+        })],
+      });
+    }
+    if (url === indexerUrl && options.method === "POST") {
+      return response({
+        data: {
+          pool: {
+            id: pool.toLowerCase(),
+            feeTier: 3000,
+            tickSpacing: 60,
+            token0: { id: token, symbol: "SEASON" },
+            token1: { id: quote, symbol: "WETH" },
+          },
+        },
+      });
+    }
+    if (url.includes("goplus")) return response({ result: {} });
+    return response({ pairs: [] });
+  };
+  const router = {
+    get: () => ({
+      getPoolState: async () => {
+        rpcCalls.push("getPoolState");
+        return { fee: 3000, tickSpacing: 60 };
+      },
+    }),
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: token,
+    config: {
+      rpcByChain: { robinhood: ["https://robinhood.example"] },
+      indexer: { url: indexerUrl, type: "subgraph" },
+    },
+    router,
+    fetchImpl,
+    enableRpcFallback: true,
+  });
+
+  assert.equal(analysis.addressType, "token");
+  assert.equal(analysis.primary.feePercent, 0.3);
+  assert.equal(analysis.primary.feeTier, 3000);
+  assert.equal(analysis.primary.tickSpacing, 60);
+  assert.equal(analysis.primary.feeSource, "dexscreener");
+  assert.equal(rpcCalls.length, 0, "subgraph feeTier must short-circuit the RPC fallback");
+  assert.match(formatPoolAnalysis(analysis), /fee 0\.3%/);
 });
 
 test("falls back to on-chain fee() when the indexer has no pool", async () => {
@@ -627,6 +693,8 @@ test("falls back to on-chain fee() when the indexer has no pool", async () => {
   });
 
   assert.equal(analysis.primary.feePercent, 1);
+  assert.equal(analysis.primary.feeTier, 10000);
+  assert.equal(analysis.primary.tickSpacing, 200);
   assert.equal(analysis.primary.feeSource, "rpc");
   assert.deepEqual(rpcCalls, ["getPoolState"]);
   assert.match(formatPoolAnalysis(analysis), /fee 1\.0%/);

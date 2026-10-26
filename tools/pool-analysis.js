@@ -287,6 +287,30 @@ function resolveFeePercent(...candidates) {
   return null;
 }
 
+/** Canonical Uniswap v3 tick spacing for the standard fee tiers. */
+const FEE_TIER_TICK_SPACING = Object.freeze({
+  100: 1,
+  500: 10,
+  3_000: 60,
+  10_000: 200,
+});
+
+/**
+ * Normalize one raw uint24 fee value (from `fee()` or `slot0`/state) into the
+ * complete metadata shape used by the screening table.
+ */
+function feeMetadataFromRaw(rawFee) {
+  if (rawFee == null || rawFee === "") return null;
+  const feeTier = Number(rawFee);
+  if (!Number.isInteger(feeTier) || feeTier <= 0 || feeTier > 1_000_000) return null;
+  return {
+    feeTier,
+    feePercent: feeFromRaw(feeTier),
+    tickSpacing: FEE_TIER_TICK_SPACING[feeTier] ?? null,
+    source: "rpc",
+  };
+}
+
 // ─── Indexer service (Subgraph / Defined.fi / Envio) ─────────────────
 // Resolves the canonical Uniswap v3 fee tier (uint24) and tick spacing from a
 // Pool/Factory entity. Endpoints are configured through `INDEXER_API_URL`,
@@ -632,10 +656,12 @@ function applyIndexerMetadata(pool, indexed) {
   }
   if (pool.feeTier == null && indexed.feeTier != null) {
     pool.feeTier = indexed.feeTier;
+    if (!pool.feeSource) pool.feeSource = indexed.source;
     applied = true;
   }
   if (pool.tickSpacing == null && indexed.tickSpacing != null) {
     pool.tickSpacing = indexed.tickSpacing;
+    if (!pool.feeSource) pool.feeSource = indexed.source;
     applied = true;
   }
   return applied;
@@ -1018,7 +1044,11 @@ async function readFeeOnChain(pool, { config, router, enableRpcFallback, timeout
           timeoutMs,
           "pool fee",
         );
-        return feeFromRaw(state?.fee);
+        const metadata = feeMetadataFromRaw(state?.fee);
+        if (metadata) {
+          metadata.tickSpacing = num(state?.tickSpacing) ?? metadata.tickSpacing;
+        }
+        return metadata;
       }
       if (!client?.provider?.call) return null;
       const data = await withTimeout(
@@ -1026,7 +1056,7 @@ async function readFeeOnChain(pool, { config, router, enableRpcFallback, timeout
         timeoutMs,
         "pool fee",
       );
-      return data && data !== "0x" ? feeFromRaw(BigInt(data)) : null;
+      return data && data !== "0x" ? feeMetadataFromRaw(BigInt(data)) : null;
     }
     if (!chain?.rpcUrl) return null;
     const provider = new JsonRpcProvider(chain.rpcUrl, chain.chainId, { staticNetwork: true });
@@ -1036,7 +1066,7 @@ async function readFeeOnChain(pool, { config, router, enableRpcFallback, timeout
         5_000,
         "pool fee",
       );
-      return data && data !== "0x" ? feeFromRaw(BigInt(data)) : null;
+      return data && data !== "0x" ? feeMetadataFromRaw(BigInt(data)) : null;
     } finally {
       provider.destroy();
     }
@@ -1615,9 +1645,9 @@ export async function analyzePoolAddress({
   }
 
   // Fee pipeline: aggregator -> subgraph/indexer -> on-chain fee() RPC.
-  // Enrich every displayed pool that is missing a fee tier or tick spacing.
+  // Enrich every displayed pool missing a fee tier, percentage or tick spacing.
   await Promise.all(scopedPools.map(async (pool) => {
-    if (pool.feePercent != null && pool.tickSpacing != null) return;
+    if (pool.feePercent != null && pool.feeTier != null && pool.tickSpacing != null) return;
     const indexed = await fetchIndexerPool(pool.pool, {
       chainKey: pool.chain,
       config,
@@ -1627,19 +1657,27 @@ export async function analyzePoolAddress({
     applyIndexerMetadata(pool, indexed);
   }));
 
-  // Last resort: read fee() on-chain for pools still missing a fee tier.
+  // Last resort: read fee() on-chain for pools still missing fee metadata.
   await Promise.all(scopedPools.map(async (pool) => {
-    if (pool.feePercent == null) {
-      const rpcFee = await readFeeOnChain(pool, {
-        config,
-        router,
-        enableRpcFallback,
-        timeoutMs,
-      });
-      if (rpcFee != null) {
-        pool.feePercent = rpcFee;
+    if (pool.feePercent != null && pool.feeTier != null) return;
+    const rpcFee = await readFeeOnChain(pool, {
+      config,
+      router,
+      enableRpcFallback,
+      timeoutMs,
+    });
+    if (rpcFee) {
+      if (pool.feePercent == null && rpcFee.feePercent != null) {
+        pool.feePercent = rpcFee.feePercent;
         pool.feeSource = "rpc";
       }
+      if (pool.feeTier == null && rpcFee.feeTier != null) {
+        pool.feeTier = rpcFee.feeTier;
+      }
+      if (pool.tickSpacing == null && rpcFee.tickSpacing != null) {
+        pool.tickSpacing = rpcFee.tickSpacing;
+      }
+      if (!pool.feeSource) pool.feeSource = "rpc";
     }
   }));
 
