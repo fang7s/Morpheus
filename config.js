@@ -171,7 +171,16 @@ export const RPC_ENV_PREFIXES = {
 };
 
 /** Indexer protocol types accepted by tools/pool-analysis.js. */
-const INDEXER_TYPES = new Set(["auto", "graphql", "subgraph", "envio", "defined", "rest"]);
+const INDEXER_TYPES = new Set([
+  "auto",
+  "graphql",
+  "subgraph",
+  "envio",
+  "defined",
+  "rest",
+  "generic",
+  "api",
+]);
 
 const DEFAULTS = {
   chain: "arbitrum",
@@ -480,7 +489,17 @@ function validate(config, { allowEmptyPositions = false } = {}) {
   if (!Array.isArray(config.rpcUrls) || config.rpcUrls.length === 0) {
     errors.push("no active RPC URL configured");
   }
-  if (config.indexer?.url && !/^https?:\/\//i.test(config.indexer.url)) {
+  // INDEXER_API_URL is a generic endpoint only. Chain-scoped subgraph URLs
+  // (SUBGRAPH_URL_<chainId>) are stored in indexer.byChain and are validated
+  // below. Do not warn about INDEXER_API_URL in subgraph mode or when it is
+  // empty; only generic/api modes require an http(s) URL.
+  const indexerType = String(config.indexer?.type || "").trim().toLowerCase();
+  const validateGenericIndexerUrl = indexerType === "generic" || indexerType === "api";
+  if (
+    validateGenericIndexerUrl
+    && config.indexer?.url
+    && !/^https?:\/\//i.test(config.indexer.url)
+  ) {
     config.indexer.url = "";
     config.warnings.push(
       "INDEXER_API_URL is not an http(s) URL — generic indexer fallback ignored.",

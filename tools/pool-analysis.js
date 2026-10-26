@@ -26,6 +26,8 @@ const INDEXER_PROTOCOLS = new Set([
   "envio",
   "defined",
   "rest",
+  "generic",
+  "api",
 ]);
 
 const INDEXER_GRAPHQL_QUERY = `

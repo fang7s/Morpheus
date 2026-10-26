@@ -170,6 +170,51 @@ test("indexer env vars map per chain and fall back to INDEXER_API_URL", () => {
   });
 });
 
+test("INDEXER_API_URL validation is skipped for subgraph and empty URLs", () => {
+  withEnv({
+    INDEXER_API_TYPE: "subgraph",
+    INDEXER_API_URL: "not-a-url",
+  }, () => {
+    const config = loadConfig({ allowEmptyPositions: true });
+    assert.equal(config.indexer.type, "subgraph");
+    assert.ok(
+      !config.warnings.some((warning) => warning.includes("INDEXER_API_URL is not")),
+    );
+  });
+
+  withEnv({
+    INDEXER_API_TYPE: "generic",
+    INDEXER_API_URL: "",
+  }, () => {
+    const config = loadConfig({ allowEmptyPositions: true });
+    assert.ok(
+      !config.warnings.some((warning) => warning.includes("INDEXER_API_URL is not")),
+    );
+  });
+
+  withEnv({
+    INDEXER_API_TYPE: "api",
+    INDEXER_API_URL: "not-a-url",
+  }, () => {
+    const config = loadConfig({ allowEmptyPositions: true });
+    assert.equal(config.indexer.url, "");
+    assert.ok(
+      config.warnings.some((warning) => warning.includes("INDEXER_API_URL is not")),
+    );
+  });
+
+  withEnv({
+    INDEXER_API_TYPE: "generic",
+    INDEXER_API_URL: "https://indexer.example/api",
+  }, () => {
+    const config = loadConfig({ allowEmptyPositions: true });
+    assert.equal(config.indexer.url, "https://indexer.example/api");
+    assert.ok(
+      !config.warnings.some((warning) => warning.includes("INDEXER_API_URL is not")),
+    );
+  });
+});
+
 test("chainRuntimeConfig swaps chain metadata and its RPC route", () => {
   const config = loadConfig({ chain: "base", allowEmptyPositions: true });
   const bnb = chainRuntimeConfig(config, "bsc");
