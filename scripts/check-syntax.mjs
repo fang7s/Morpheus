@@ -21,6 +21,13 @@ const files = [
   "tools/telegram-commands.js",
   "tools/deploy.js",
   "tools/position-manager.js",
+  "src/intel/index.js",
+  "src/intel/defillama.js",
+  "src/intel/rpcAnalyzer.js",
+  "src/intel/lib/defillama.js",
+  "src/intel/lib/rpcAnalyzer.js",
+  "src/intel/lib/cli.js",
+  "src/intel/lib/index.js",
 ];
 
 let failed = false;

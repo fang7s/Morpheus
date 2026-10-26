@@ -9,14 +9,22 @@
     "start": "node index.js",
     "once": "node index.js --once",
     "check": "node index.js --check",
-    "test": "npm run test:syntax && npm run test:unit",
+    "intel": "node src/intel/lib/cli.js",
+    "build:intel": "tsc -p tsconfig.intel.json",
+    "check:intel": "tsc -p tsconfig.intel.json --noEmit",
+    "test": "npm run build:intel && npm run test:syntax && npm run test:unit",
     "test:syntax": "node scripts/check-syntax.mjs",
-    "test:unit": "node --test test/evil-panda.test.js test/chains.test.js test/discovery.test.js test/pool-analysis.test.js test/telegram-commands.test.js test/deploy.test.js"
+    "test:unit": "node --test test/evil-panda.test.js test/chains.test.js test/discovery.test.js test/pool-analysis.test.js test/telegram-commands.test.js test/deploy.test.js test/intel.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
     "ethers": "^6.13.4",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "viem": "^2.57.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.3"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -121,7 +121,46 @@ enforced every monitoring cycle (price-based TP/SL, OOR close, interval alerts).
 | `npm run check` | Validate config and all RPC routes (no RPC calls) |
 | `npm start` | Start the shadow/live poller |
 | `npm run once` | Run one evaluation cycle, then exit |
-| `npm test` | Syntax checks and unit tests |
+| `npm run intel -- <token>` | Robinhood Chain price + security report (DeFiLlama + RPC) |
+| `npm run build:intel` | Compile `src/intel/ts` to `src/intel/lib` |
+| `npm run check:intel` | Strict TypeScript check for the intel module |
+| `npm test` | Intel build, syntax checks and unit tests |
 
 > Shadow mode is the default. Live trading requires `DRY_RUN=false`,
 > `I_UNDERSTAND_LIVE_TRADING=true` and `PRIVATE_KEY`.
+
+## Robinhood Token Intel (DeFiLlama + direct RPC)
+
+Morpheus now includes the standalone `robinhood-token-intel` analyzer as a
+first-class module at `src/intel/`. It needs **no GoPlus**: pricing comes from
+DeFiLlama and token/contract facts come directly from Robinhood Chain RPC
+(chain id `4663`) through viem.
+
+```powershell
+# Default token is ASSAY; JSON output
+npm run intel -- 0xa2b38467e9b60c016d94977ad37f825da4cd3462 --json
+
+# Any Robinhood Chain token, explicit RPC
+npm run intel -- 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73 --rpc https://robinhood-rpc.publicnode.com
+```
+
+Import it in Morpheus code through the stable barrel:
+
+```js
+import {
+  analyzeTokenOnChain,
+  fetchDefiLlamaPrice,
+  runAnalysis,
+  renderReport,
+} from "./src/intel/index.js";
+
+const report = await runAnalysis("0xa2b38467e9b60c016d94977ad37f825da4cd3462");
+console.log(renderReport(report));
+```
+
+TypeScript sources live in `src/intel/ts/`; compiled ESM and declarations are
+written to `src/intel/lib/`. That output is checked into the project (not
+gitignored), so plain `node index.js` does not require a build step. After
+editing TypeScript, run `npm run build:intel` (or `npm test`, which builds
+first). See `src/intel/README.md` for endpoints, selector semantics and risk
+heuristics.

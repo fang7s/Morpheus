@@ -19,6 +19,7 @@ active-automations.json
 coverage/
 dist/
 build/
+*.tsbuildinfo
 
 # OS
 .DS_Store
