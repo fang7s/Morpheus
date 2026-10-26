@@ -101,11 +101,17 @@ test("analyzes a token across multiple chains with pools, metrics and safety", a
   const config = {
     rpcByChain: { base: ["https://base.example"], polygon: ["https://polygon.example"] },
   };
+  const publicClient = {
+    readContract: async ({ address }) => (
+      String(address).toLowerCase() === POOL_BASE.toLowerCase() ? 500 : 3000
+    ),
+  };
 
   const analysis = await analyzePoolAddress({
     address: TOKEN,
     config,
     router,
+    publicClient,
     fetchImpl,
     enableRpcFallback: true,
   });
@@ -826,11 +832,20 @@ test("token screening enriches every pool with feeTier and tickSpacing before fo
   const quote = "0x4444444444444444444444444444444444444444";
   const poolA = "0x5555555555555555555555555555555555555555";
   const poolB = "0x6666666666666666666666666666666666666666";
-  const rpcCalls = [];
+  const readCalls = [];
   const fees = new Map([
     [poolA.toLowerCase(), { fee: 500, tickSpacing: 10 }],
     [poolB.toLowerCase(), { fee: 10000, tickSpacing: 200 }],
   ]);
+  const publicClient = {
+    readContract: async ({ address, abi, functionName }) => {
+      const key = String(address).toLowerCase();
+      readCalls.push(key);
+      assert.equal(functionName, "fee");
+      assert.equal(abi[0].outputs[0].type, "uint24");
+      return fees.get(key)?.fee ?? null;
+    },
+  };
 
   const fetchImpl = async (url) => {
     if (url.includes("dexscreener") && url.includes("/tokens/")) {
@@ -858,15 +873,6 @@ test("token screening enriches every pool with feeTier and tickSpacing before fo
     if (url.includes("goplus")) return response({ result: {} });
     return response({ pairs: [] });
   };
-  const client = {
-    getPoolState: async (pool) => {
-      rpcCalls.push(pool.toLowerCase());
-      const fee = fees.get(pool.toLowerCase());
-      if (!fee) throw new Error("unknown pool");
-      return fee;
-    },
-  };
-
   const analysis = await analyzePoolAddress({
     address: token,
     config: {
@@ -874,7 +880,7 @@ test("token screening enriches every pool with feeTier and tickSpacing before fo
       rpcByChain: { base: ["https://base.example"] },
       indexer: { enabled: false },
     },
-    router: { get: () => client },
+    publicClient,
     fetchImpl,
     timeoutMs: 1_000,
     enableRpcFallback: true,
@@ -889,8 +895,10 @@ test("token screening enriches every pool with feeTier and tickSpacing before fo
   assert.equal(byPool.get(poolB.toLowerCase()).feeTier, 10000);
   assert.equal(byPool.get(poolB.toLowerCase()).feePercent, 1);
   assert.equal(byPool.get(poolB.toLowerCase()).tickSpacing, 200);
-  assert.ok(rpcCalls.includes(poolA.toLowerCase()));
-  assert.ok(rpcCalls.includes(poolB.toLowerCase()));
+  assert.deepEqual(
+    [...readCalls].sort(),
+    [poolA.toLowerCase(), poolB.toLowerCase()].sort(),
+  );
 
   const text = formatPoolAnalysis(analysis);
   assert.match(text, /fee 0\.05%/);
@@ -902,7 +910,7 @@ test("falls back to on-chain fee() when the indexer has no pool", async () => {
   const token = "0x9999999999999999999999999999999999999999";
   const quote = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const indexerUrl = "https://indexer.example/graphql";
-  const rpcCalls = [];
+  const readCalls = [];
 
   const fetchImpl = async (url, options = {}) => {
     if (url.includes("dexscreener") && url.includes("/tokens/")) {
@@ -922,13 +930,12 @@ test("falls back to on-chain fee() when the indexer has no pool", async () => {
     if (url.includes("goplus")) return response({ result: {} });
     return response({ pairs: [] });
   };
-  const router = {
-    get: () => ({
-      getPoolState: async () => {
-        rpcCalls.push("getPoolState");
-        return { fee: 10000 };
-      },
-    }),
+  const publicClient = {
+    readContract: async ({ address, functionName }) => {
+      readCalls.push(String(address).toLowerCase());
+      assert.equal(functionName, "fee");
+      return 10000;
+    },
   };
 
   const analysis = await analyzePoolAddress({
@@ -937,16 +944,84 @@ test("falls back to on-chain fee() when the indexer has no pool", async () => {
       rpcByChain: { base: ["https://base.example"] },
       indexer: { url: indexerUrl, type: "graphql" },
     },
-    router,
+    publicClient,
     fetchImpl,
     enableRpcFallback: true,
   });
 
   assert.equal(analysis.primary.feePercent, 1);
   assert.equal(analysis.primary.feeTier, 10000);
+  assert.equal(analysis.primary.fee, 10000);
   assert.equal(analysis.primary.tickSpacing, 200);
   assert.equal(analysis.primary.feeSource, "rpc");
-  assert.deepEqual(rpcCalls, ["getPoolState"]);
+  assert.deepEqual(readCalls, [pool.toLowerCase()]);
   assert.match(formatPoolAnalysis(analysis), /fee 1\.0%/);
+});
+
+test("token screening resolves missing fees for all top-10 pools via direct readContract", async () => {
+  const token = "0x7777777777777777777777777777777777777777";
+  const pools = Array.from(
+    { length: 10 },
+    (_, index) => `0x${String(index + 1).padStart(2, "0").repeat(20)}`,
+  );
+  const readCalls = [];
+  const publicClient = {
+    readContract: async ({ address, abi, functionName }) => {
+      readCalls.push(String(address).toLowerCase());
+      assert.equal(functionName, "fee");
+      assert.equal(abi[0]?.name, "fee");
+      assert.equal(abi[0]?.outputs?.[0]?.type, "uint24");
+      return 3000;
+    },
+  };
+
+  const fetchImpl = async (url) => {
+    if (url.includes("dexscreener") && url.includes("/tokens/")) {
+      return response({
+        pairs: pools.map((pool, index) => dexPair({
+          pairAddress: pool,
+          // Aggregator omits both fee representations.
+          feeTier: null,
+          fee: null,
+          liquidity: { usd: 1_000_000 - index * 10_000 },
+          baseToken: { address: token, name: "Morph", symbol: "MORPH" },
+          quoteToken: { address: USDC, name: "USD Coin", symbol: "USDC" },
+        })),
+      });
+    }
+    if (url.includes("goplus")) return response({ result: {} });
+    return response({ pairs: [] });
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: token,
+    config: {
+      chain: "base",
+      rpcByChain: { base: ["https://base.example"] },
+      indexer: { enabled: false },
+    },
+    publicClient,
+    fetchImpl,
+    timeoutMs: 1_000,
+    enableRpcFallback: true,
+  });
+
+  assert.equal(analysis.addressType, "token");
+  assert.equal(analysis.pools.length, 10);
+  for (const pool of analysis.pools) {
+    assert.equal(pool.feeTier, 3000);
+    assert.equal(pool.feePercent, 0.3);
+    assert.equal(pool.fee, 3000);
+    assert.equal(pool.feeSource, "rpc");
+    assert.equal(pool.tickSpacing, 60);
+  }
+  assert.deepEqual(
+    [...readCalls].sort(),
+    pools.map((pool) => pool.toLowerCase()).sort(),
+  );
+
+  const text = formatPoolAnalysis(analysis);
+  assert.match(text, /fee 0\.3%/);
+  assert.doesNotMatch(text, /fee n\/a/);
 });
 

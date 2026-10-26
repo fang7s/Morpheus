@@ -3,6 +3,7 @@
 // GoPlus, enriches fee tiers from RPC when possible, and renders a risk report.
 
 import { JsonRpcProvider } from "ethers";
+import { createPublicClient, fallback, http } from "viem";
 import { escapeHtml, escapeHtmlAttr } from "./html.js";
 
 const DEXSCREENER_API = "https://api.dexscreener.com/latest/dex";
@@ -16,6 +17,20 @@ const SYMBOL_SELECTOR = "0x95d89b41";
 const TICK_SPACING_SELECTOR = "0xd0c93a7c";
 const MAX_POOLS = 10;
 const DETAILED_POOLS = 3;
+
+/** viem ABI used by the direct pool.fee() fallback. */
+const POOL_FEE_ABI = [
+  {
+    name: "fee",
+    type: "function",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "uint24" }],
+  },
+];
+
+/** One viem client per chain/URL-set so parallel pool reads share transports. */
+const poolFeeClients = new Map();
 
 // ─── Indexer / subgraph endpoints ────────────────────────────────────
 // Secondary source for pool metadata when DexScreener/GeckoTerminal omit the
@@ -307,6 +322,7 @@ function feeMetadataFromRaw(rawFee) {
   return {
     feeTier,
     feePercent: feeFromRaw(feeTier),
+    fee: feeTier,
     tickSpacing: FEE_TIER_TICK_SPACING[feeTier] ?? null,
     source: "rpc",
   };
@@ -358,9 +374,33 @@ function finalizeFeeMetadata(pool) {
   if (pool.tickSpacing == null && pool.feeTier != null) {
     pool.tickSpacing = FEE_TIER_TICK_SPACING[pool.feeTier] ?? null;
   }
+  // Keep the raw uint24 representation alongside the display percentage. The
+  // renderer accepts either, but downstream sizing math expects the raw tier.
+  if (pool.feeTier != null) pool.fee = pool.feeTier;
   if (!pool.feeSource && (pool.feePercent != null || pool.feeTier != null)) {
     pool.feeSource = "derived";
   }
+  return pool;
+}
+
+/**
+ * Mutate a pool with resolved fee metadata from any source. RPC responses carry
+ * both the raw uint24 (`feeTier`, `fee`) and the display percentage.
+ */
+function applyResolvedFee(pool, metadata) {
+  if (!pool || !metadata) return pool;
+  const rawFee = Number(metadata.feeTier ?? metadata.fee);
+  if (Number.isInteger(rawFee) && rawFee > 0) {
+    pool.feeTier = rawFee;
+    pool.feePercent = metadata.feePercent ?? feeFromRaw(rawFee);
+    pool.fee = rawFee;
+  } else if (metadata.feePercent != null) {
+    pool.feePercent = metadata.feePercent;
+    pool.feeTier = metadata.feeTier ?? feeTierForPercent(metadata.feePercent);
+    if (pool.feeTier != null) pool.fee = pool.feeTier;
+  }
+  if (metadata.tickSpacing != null) pool.tickSpacing = metadata.tickSpacing;
+  if (metadata.source) pool.feeSource = metadata.source;
   return pool;
 }
 
@@ -1090,6 +1130,70 @@ async function fetchGoPlus(tokenAddress, chainKey, fetchImpl, timeoutMs) {
   };
 }
 
+function poolFeeRpcUrls(chain, config) {
+  const configured = config?.rpcByChain?.[chain.key];
+  const urls = (Array.isArray(configured) ? configured : configured ? [configured] : [])
+    .map((url) => String(url || "").trim())
+    .filter(Boolean);
+  if (urls.length > 0) return [...new Set(urls)];
+  return chain.rpcUrl ? [chain.rpcUrl] : [];
+}
+
+function getPoolFeePublicClient(chain, config, timeoutMs) {
+  const urls = poolFeeRpcUrls(chain, config);
+  if (urls.length === 0) return null;
+
+  const cacheKey = `${chain.key}|${urls.join("|")}|${timeoutMs}`;
+  let client = poolFeeClients.get(cacheKey);
+  if (!client) {
+    client = createPublicClient({
+      transport: fallback(
+        urls.map((url) => http(url, { timeout: timeoutMs, retryCount: 0 })),
+        { rank: false },
+      ),
+    });
+    poolFeeClients.set(cacheKey, client);
+  }
+  return client;
+}
+
+/**
+ * Direct uint24 fee() read through viem. This is deliberately independent of
+ * router.getPoolState(): a failing composite state read must not silently drop
+ * the fee value for an otherwise valid pool.
+ */
+async function readPoolFeeViaPublicClient(pool, { config, publicClient, timeoutMs }) {
+  if (!isEvmAddress(pool?.pool)) return null;
+  const chain = POOL_CHAINS[pool.chain];
+  if (!chain) return null;
+
+  const client = publicClient || getPoolFeePublicClient(chain, config, timeoutMs);
+  if (!client?.readContract) return null;
+
+  try {
+    const rawFee = await withTimeout(
+      client.readContract({
+        address: pool.pool,
+        abi: POOL_FEE_ABI,
+        functionName: "fee",
+      }),
+      timeoutMs,
+      "pool fee",
+    );
+    const fee = Number(rawFee);
+    if (!Number.isInteger(fee) || fee <= 0 || fee > 1_000_000) return null;
+    return {
+      feeTier: fee,
+      feePercent: fee / 10_000,
+      fee,
+      tickSpacing: FEE_TIER_TICK_SPACING[fee] ?? null,
+      source: "rpc",
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function readFeeOnChain(pool, { config, router, enableRpcFallback, timeoutMs }) {
   if (!enableRpcFallback) return null;
   const chain = POOL_CHAINS[pool.chain];
@@ -1591,6 +1695,7 @@ export async function analyzePoolAddress({
   address,
   config = {},
   router = null,
+  publicClient = null,
   fetchImpl = globalThis.fetch,
   timeoutMs = 8_000,
   enableRpcFallback = true,
@@ -1798,8 +1903,8 @@ export async function analyzePoolAddress({
     };
   }
 
-  // Fee pipeline: aggregator -> subgraph/indexer -> on-chain fee() RPC.
-  // Enrich every displayed pool missing a fee tier, percentage or tick spacing.
+  // Fee pipeline: aggregator -> subgraph/indexer -> direct RPC fee() -> router.
+  // Enrich every displayed pool (including all top-10) before rendering.
   await Promise.all(scopedPools.map(async (pool) => {
     if (pool.feePercent != null && pool.feeTier != null && pool.tickSpacing != null) return;
     const indexed = await fetchIndexerPool(pool.pool, {
@@ -1811,33 +1916,51 @@ export async function analyzePoolAddress({
     applyIndexerMetadata(pool, indexed);
   }));
 
-  // Last resort: read fee() on-chain for pools still missing fee metadata.
-  await Promise.all(scopedPools.map(async (pool) => {
-    if (pool.feePercent != null && pool.feeTier != null) return;
-    const rpcFee = await readFeeOnChain(pool, {
-      config,
-      router,
-      enableRpcFallback,
-      timeoutMs,
-    });
-    if (rpcFee) {
-      if (pool.feePercent == null && rpcFee.feePercent != null) {
-        pool.feePercent = rpcFee.feePercent;
-        pool.feeSource = "rpc";
-      }
-      if (pool.feeTier == null && rpcFee.feeTier != null) {
-        pool.feeTier = rpcFee.feeTier;
-      }
-      if (pool.tickSpacing == null && rpcFee.tickSpacing != null) {
-        pool.tickSpacing = rpcFee.tickSpacing;
-      }
-      if (!pool.feeSource) pool.feeSource = "rpc";
-    }
-  }));
+  // Direct on-chain fee() read for every pool still missing fee metadata. This
+  // must not depend on router.getPoolState(), whose composite read can fail
+  // silently while the pool's fee() remains available.
+  if (enableRpcFallback) {
+    await Promise.all(scopedPools.map(async (pool) => {
+      if (pool.feePercent != null && pool.feeTier != null) return;
+      const rpcFee = await readPoolFeeViaPublicClient(pool, {
+        config,
+        publicClient,
+        timeoutMs,
+      });
+      applyResolvedFee(pool, rpcFee);
+    }));
+  }
+
+  // Compatibility fallback for custom routers/providers. Runs only when the
+  // direct fee() read did not produce both fee representations.
+  if (enableRpcFallback) {
+    await Promise.all(scopedPools.map(async (pool) => {
+      if (pool.feePercent != null && pool.feeTier != null) return;
+      const rpcFee = await readFeeOnChain(pool, {
+        config,
+        router,
+        enableRpcFallback,
+        timeoutMs,
+      });
+      applyResolvedFee(pool, rpcFee);
+    }));
+  }
 
   // Guarantee the renderer always has both representations, even when an API
   // returned only `fee` or only `feeTier`.
   for (const pool of scopedPools) finalizeFeeMetadata(pool);
+
+  // Surface unresolved fee reads instead of silently rendering "fee n/a".
+  const unresolvedFees = scopedPools.filter(
+    (pool) => pool.feeTier == null && pool.feePercent == null,
+  );
+  if (enableRpcFallback && unresolvedFees.length > 0) {
+    errors.push(
+      `Fee RPC: no fee() response for ${unresolvedFees
+        .map((pool) => shortAddress(pool.pool))
+        .join(", ")}`,
+    );
+  }
 
   // Token-level security: a token input queries GoPlus with the TOKEN address;
   // a pool input queries GoPlus for both underlying token0 and token1.
