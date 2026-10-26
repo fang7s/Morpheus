@@ -13,6 +13,7 @@ const TOKEN0_SELECTOR = "0x0dfe1681";
 const TOKEN1_SELECTOR = "0xd21220a7";
 const DECIMALS_SELECTOR = "0x313ce567";
 const SYMBOL_SELECTOR = "0x95d89b41";
+const TICK_SPACING_SELECTOR = "0xd0c93a7c";
 const MAX_POOLS = 10;
 const DETAILED_POOLS = 3;
 
@@ -311,6 +312,41 @@ function feeMetadataFromRaw(rawFee) {
   };
 }
 
+/** Reverse-map a canonical percentage (0.3) back to its uint24 tier (3000). */
+function feeTierForPercent(percent) {
+  const value = Number(percent);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const target = Number(value.toFixed(6));
+  for (const [tier, label] of Object.entries(UNISWAP_FEE_TIERS)) {
+    const tierPercent = Number(label.replace("%", ""));
+    if (Math.abs(tierPercent - target) < 1e-6) return Number(tier);
+  }
+  return null;
+}
+
+/**
+ * Ensure both display and raw fee fields exist on a pool. Aggregators may return
+ * only a percentage (or only a raw tier), so derive the missing counterpart and
+ * its standard tick spacing before rendering.
+ */
+function finalizeFeeMetadata(pool) {
+  if (!pool) return pool;
+  if (pool.feeTier == null) {
+    const derived = feeTierForPercent(pool.feePercent);
+    if (derived != null) pool.feeTier = derived;
+  }
+  if (pool.feePercent == null && pool.feeTier != null) {
+    pool.feePercent = feeFromRaw(pool.feeTier);
+  }
+  if (pool.tickSpacing == null && pool.feeTier != null) {
+    pool.tickSpacing = FEE_TIER_TICK_SPACING[pool.feeTier] ?? null;
+  }
+  if (!pool.feeSource && (pool.feePercent != null || pool.feeTier != null)) {
+    pool.feeSource = "derived";
+  }
+  return pool;
+}
+
 // ─── Indexer service (Subgraph / Defined.fi / Envio) ─────────────────
 // Resolves the canonical Uniswap v3 fee tier (uint24) and tick spacing from a
 // Pool/Factory entity. Endpoints are configured through `INDEXER_API_URL`,
@@ -497,7 +533,7 @@ function normalizeIndexerPool(payload, indexer) {
   const rawFeeNumber = Number(rawFee);
   const feeTier = Number.isInteger(rawFeeNumber) && rawFeeNumber > 0 && rawFeeNumber <= 1_000_000
     ? rawFeeNumber
-    : null;
+    : feeTierForPercent(feePercent);
   const tickSpacing = num(
     entity.tickSpacing ?? entity.tick_spacing ?? nested.tickSpacing ?? null,
   );
@@ -735,6 +771,9 @@ function normalizeDexPair(pair) {
   const rawFee = pair.feeTier ?? pair.fee;
   const feePercent = resolveFeePercent(rawFee, pair.feeTier, pair.fee, pair.name);
   const rawFeeNumber = Number(rawFee);
+  const feeTier = Number.isInteger(rawFeeNumber) && rawFeeNumber > 0
+    ? rawFeeNumber
+    : feeTierForPercent(feePercent);
   const chain = POOL_CHAINS[chainKey];
 
   return {
@@ -746,7 +785,7 @@ function normalizeDexPair(pair) {
     pool,
     poolId: String(pair.pairAddress || ""),
     feePercent,
-    feeTier: Number.isInteger(rawFeeNumber) && rawFeeNumber > 0 ? rawFeeNumber : null,
+    feeTier,
     feeSource: feePercent != null ? "dexscreener" : null,
     feeRaw: rawFee,
     tvl: num(pair.liquidity?.usd),
@@ -879,7 +918,9 @@ function normalizeGeckoPool(item) {
     pool,
     poolId: String(attrs.address || geckoIdPart(item.id) || ""),
     feePercent,
-    feeTier: Number.isInteger(rawFeeNumber) && rawFeeNumber > 0 ? rawFeeNumber : null,
+    feeTier: Number.isInteger(rawFeeNumber) && rawFeeNumber > 0
+      ? rawFeeNumber
+      : feeTierForPercent(feePercent),
     feeSource: feePercent != null ? "geckoterminal" : null,
     feeRaw: rawFee,
     tvl: num(attrs.reserve_in_usd),
@@ -1084,7 +1125,20 @@ async function detectChainsByCode(address, { config, router, enableRpcFallback, 
         if (config?.rpcByChain?.[chain.key] && router) {
           const client = router.get(chain.key);
           const code = await withTimeout(client.provider.getCode(address), timeoutMs, "chain code");
-          return code && code !== "0x" ? chain.key : null;
+          if (code && code !== "0x") return chain.key;
+          if (client?.getPoolState) {
+            try {
+              const state = await withTimeout(
+                client.getPoolState(address),
+                timeoutMs,
+                "pool state",
+              );
+              if (state?.token0 && state?.token1) return chain.key;
+            } catch {
+              // Address is not a pool on this chain.
+            }
+          }
+          return null;
         }
         if (!chain.rpcUrl) return null;
         provider = new JsonRpcProvider(chain.rpcUrl, chain.chainId, { staticNetwork: true });
@@ -1145,26 +1199,72 @@ async function probeAddressRole(address, {
 
   const results = await Promise.allSettled(chains.map(async (chain) => {
     const opts = { config, router, timeoutMs };
-    const [token0Data, token1Data, decimalsData] = await Promise.all([
-      callContract(address, TOKEN0_SELECTOR, chain, opts),
-      callContract(address, TOKEN1_SELECTOR, chain, opts),
-      callContract(address, DECIMALS_SELECTOR, chain, opts),
-    ]);
+    const client = config?.rpcByChain?.[chain.key] && router
+      ? router.get?.(chain.key)
+      : null;
+
+    // Prefer the chain client's pool-state reader: it resolves token0/token1,
+    // fee, tickSpacing, price and liquidity even when raw eth_call routing is
+    // unavailable or the RPC rejects one of the auxiliary calls.
+    if (client?.getPoolState) {
+      try {
+        const state = await withTimeout(
+          client.getPoolState(address),
+          timeoutMs,
+          "pool state",
+        );
+        if (state?.token0 && state?.token1) {
+          const metadata = feeMetadataFromRaw(state.fee);
+          return {
+            kind: "pool",
+            chain: chain.key,
+            chainName: chain.name,
+            token0: state.token0,
+            token1: state.token1,
+            token0Symbol: state.token0Symbol || null,
+            token1Symbol: state.token1Symbol || null,
+            decimals0: num(state.decimals0),
+            decimals1: num(state.decimals1),
+            feePercent: metadata?.feePercent ?? feeFromRaw(state.fee),
+            feeTier: metadata?.feeTier ?? null,
+            tickSpacing: num(state.tickSpacing) ?? metadata?.tickSpacing ?? null,
+            price: num(state.price),
+            liquidity: state.liquidity ?? null,
+          };
+        }
+      } catch {
+        // Not a v3 pool on this chain, or the client is unavailable. Fall back
+        // to raw selector calls below.
+      }
+    }
+
+    const [token0Data, token1Data, decimalsData, feeData, tickSpacingData] =
+      await Promise.all([
+        callContract(address, TOKEN0_SELECTOR, chain, opts),
+        callContract(address, TOKEN1_SELECTOR, chain, opts),
+        callContract(address, DECIMALS_SELECTOR, chain, opts),
+        callContract(address, FEE_SELECTOR, chain, opts),
+        callContract(address, TICK_SPACING_SELECTOR, chain, opts),
+      ]);
 
     const token0 = decodeAddressWord(token0Data);
     const token1 = decodeAddressWord(token1Data);
     if (token0 && token1) {
-      let feePercent = null;
-      const feeData = await callContract(address, FEE_SELECTOR, chain, opts);
       const rawFee = decodeUint(feeData);
-      if (rawFee != null && rawFee <= 1_000_000n) feePercent = feeFromRaw(Number(rawFee));
+      const metadata = rawFee != null && rawFee <= 1_000_000n
+        ? feeMetadataFromRaw(rawFee)
+        : null;
       return {
         kind: "pool",
         chain: chain.key,
         chainName: chain.name,
         token0,
         token1,
-        feePercent,
+        feePercent: metadata?.feePercent ?? null,
+        feeTier: metadata?.feeTier ?? null,
+        tickSpacing: decodeUint(tickSpacingData) != null
+          ? Number(decodeUint(tickSpacingData))
+          : metadata?.tickSpacing ?? null,
       };
     }
 
@@ -1292,6 +1392,8 @@ function syntheticPool({
   feeTier = null,
   tickSpacing = null,
   feeSource = null,
+  priceNative = null,
+  liquidity = null,
 }) {
   const chain = POOL_CHAINS[chainKey];
   const metas = tokens.map((token) => ({
@@ -1315,8 +1417,9 @@ function syntheticPool({
     feeRaw: feeTier,
     tvl: null,
     volume24h: null,
+    liquidity,
     priceUsd: null,
-    priceNative: null,
+    priceNative,
     quotePriceUsd: null,
     priceChange24h: null,
     marketCap: null,
@@ -1518,8 +1621,11 @@ export async function analyzePoolAddress({
   }
 
   // Secondary indexer fallback: aggregators often omit Uniswap v3 pools on
-  // newer EVM chains. Query the Pool entity directly when nothing was found.
-  if (pools.length === 0) {
+  // newer EVM chains. Query the Pool entity directly when no exact pool match
+  // was returned. A token search that already resolved matching pools skips
+  // this path to avoid probing every chain.
+  let apiRole = detectApiAddressRole(input, pools);
+  if (!pools.some((pool) => sameAddress(pool.pool, input)) && apiRole !== "token") {
     for (const chainKey of indexerChainCandidates(config, [])) {
       const indexed = await fetchIndexerPool(input, {
         chainKey,
@@ -1530,13 +1636,13 @@ export async function analyzePoolAddress({
       if (!indexed?.pool || !sameAddress(indexed.pool, input)) continue;
       const fromIndexer = poolFromIndexer(indexed);
       if (fromIndexer) {
-        pools = [fromIndexer];
+        pools = dedupePools([...pools, fromIndexer]);
         break;
       }
     }
+    apiRole = detectApiAddressRole(input, pools) || apiRole;
   }
 
-  const apiRole = detectApiAddressRole(input, pools);
   const detectedChains = pools.length > 0
     ? []
     : await detectChainsByCode(input, {
@@ -1548,13 +1654,15 @@ export async function analyzePoolAddress({
   const chainCandidates = pools.length > 0
     ? [...new Set(pools.map((pool) => pool.chain))]
     : detectedChains;
-  const onChainRole = await probeAddressRole(input, {
-    chainKeys: chainCandidates,
-    config,
-    router,
-    enableRpcFallback,
-    timeoutMs,
-  });
+  const onChainRole = apiRole === "token"
+    ? null
+    : await probeAddressRole(input, {
+      chainKeys: chainCandidates,
+      config,
+      router,
+      enableRpcFallback,
+      timeoutMs,
+    });
 
   if (pools.length === 0 && !onChainRole) {
     if (detectedChains.length === 0) {
@@ -1608,6 +1716,11 @@ export async function analyzePoolAddress({
         chainKey: chain.key,
         tokens: poolTokens.slice(0, 2),
         feePercent: onChainRole?.feePercent,
+        feeTier: onChainRole?.feeTier,
+        tickSpacing: onChainRole?.tickSpacing,
+        feeSource: onChainRole?.feePercent != null ? "rpc" : null,
+        priceNative: onChainRole?.price,
+        liquidity: onChainRole?.liquidity,
       });
       scopedPools = [primary];
     }
@@ -1618,9 +1731,33 @@ export async function analyzePoolAddress({
           onChainRole.token1,
         );
       }
+      const symbolFor = (address) => {
+        if (sameAddress(address, onChainRole?.token0)) return onChainRole?.token0Symbol || null;
+        if (sameAddress(address, onChainRole?.token1)) return onChainRole?.token1Symbol || null;
+        return null;
+      };
+      const baseSymbol = symbolFor(primary.base?.address);
+      const quoteSymbol = symbolFor(primary.quote?.address);
+      if (baseSymbol) primary.base = { ...primary.base, symbol: baseSymbol };
+      if (quoteSymbol) primary.quote = { ...primary.quote, symbol: quoteSymbol };
+      if (primary.base?.symbol && primary.quote?.symbol) {
+        primary.pair = `${primary.base.symbol}/${primary.quote.symbol}`;
+      }
       if (primary.feePercent == null && onChainRole?.feePercent != null) {
         primary.feePercent = onChainRole.feePercent;
         primary.feeSource = "rpc";
+      }
+      if (primary.feeTier == null && onChainRole?.feeTier != null) {
+        primary.feeTier = onChainRole.feeTier;
+      }
+      if (primary.tickSpacing == null && onChainRole?.tickSpacing != null) {
+        primary.tickSpacing = onChainRole.tickSpacing;
+      }
+      if (primary.priceNative == null && onChainRole?.price != null) {
+        primary.priceNative = onChainRole.price;
+      }
+      if (primary.liquidity == null && onChainRole?.liquidity != null) {
+        primary.liquidity = onChainRole.liquidity;
       }
     }
   } else {
@@ -1680,6 +1817,10 @@ export async function analyzePoolAddress({
       if (!pool.feeSource) pool.feeSource = "rpc";
     }
   }));
+
+  // Guarantee the renderer always has both representations, even when an API
+  // returned only `fee` or only `feeTier`.
+  for (const pool of scopedPools) finalizeFeeMetadata(pool);
 
   // Token-level security: a token input queries GoPlus with the TOKEN address;
   // a pool input queries GoPlus for both underlying token0 and token1.
@@ -1834,6 +1975,17 @@ export function formatPoolAnalysis(analysis = {}) {
       `   Pool <code>${escapeHtml(poolAddress)}</code> | fee ${fmtFee(pool.feePercent)}`
       + `${pool.tickSpacing != null ? ` | tick ${escapeHtml(pool.tickSpacing)}` : ""}`,
     );
+    const onChainBits = [];
+    if (pool.liquidity != null) onChainBits.push(`liquidity ${escapeHtml(pool.liquidity)}`);
+    if (pool.priceNative != null) {
+      const quoteSymbol = pool.quote?.symbol || "token1";
+      const baseSymbol = pool.base?.symbol || "token0";
+      onChainBits.push(
+        `price ${fmtPrice(pool.priceNative)} `
+        + `${escapeHtml(quoteSymbol)}/${escapeHtml(baseSymbol)}`,
+      );
+    }
+    if (onChainBits.length) lines.push(`   On-chain ${onChainBits.join(" | ")}`);
     lines.push(
       `   TVL ${fmtMoney(pool.tvl)} | Vol24h ${fmtMoney(pool.volume24h)} | `
       + `Vol/TVL ${fmtRatio(pool.tvl && pool.volume24h != null

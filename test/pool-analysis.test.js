@@ -480,7 +480,7 @@ test("queries a Defined.fi style REST indexer for pool metadata", async () => {
   assert.match(requests[0].url, /\/pools\/0xe1e2/i);
   assert.equal(indexed.source, "defined");
   assert.equal(indexed.feePercent, 0.3);
-  assert.equal(indexed.feeTier, null);
+  assert.equal(indexed.feeTier, 3000);
   assert.equal(indexed.tickSpacing, 60);
   assert.equal(indexed.pair, "AAA/BBB");
 });
@@ -645,6 +645,208 @@ test("token screening fills feeTier from the subgraph when DexScreener only retu
   assert.equal(analysis.primary.feeSource, "dexscreener");
   assert.equal(rpcCalls.length, 0, "subgraph feeTier must short-circuit the RPC fallback");
   assert.match(formatPoolAnalysis(analysis), /fee 0\.3%/);
+});
+
+test("resolves a direct Robinhood pool address from the subgraph when aggregators return nothing", async () => {
+  const pool = "0xaaaaaaaabbbbbbbbccccccccddddddddeeeeeeee";
+  const token0 = "0x1234567890abcdef1234567890abcdef12345678";
+  const token1 = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+  const indexerUrl = "https://subgraph.example/graphql";
+  let indexerCalls = 0;
+
+  const fetchImpl = async (url, options = {}) => {
+    if (url === indexerUrl && options.method === "POST") {
+      indexerCalls += 1;
+      return response({
+        data: {
+          pool: {
+            id: pool.toLowerCase(),
+            feeTier: 500,
+            tickSpacing: 10,
+            token0: { id: token0, symbol: "SEASON" },
+            token1: { id: token1, symbol: "WETH" },
+          },
+        },
+      });
+    }
+    if (url.includes("goplus")) return response({ result: {} });
+    if (url.includes("geckoterminal")) return response({ data: [] });
+    return response({ pairs: [] });
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: pool,
+    config: {
+      chain: "robinhood",
+      indexer: { url: indexerUrl, type: "subgraph", byChain: { robinhood: indexerUrl } },
+    },
+    fetchImpl,
+    enableRpcFallback: false,
+  });
+
+  assert.equal(analysis.error, undefined);
+  assert.equal(analysis.addressType, "pool");
+  assert.equal(analysis.chain, "robinhood");
+  assert.equal(analysis.primary.pool, pool);
+  assert.equal(analysis.primary.feeTier, 500);
+  assert.equal(analysis.primary.feePercent, 0.05);
+  assert.equal(analysis.primary.tickSpacing, 10);
+  assert.ok(indexerCalls >= 1);
+  assert.match(formatPoolAnalysis(analysis), /fee 0\.05%/);
+});
+
+test("classifies and displays a Robinhood pool from getPoolState when aggregators return nothing", async () => {
+  const pool = "0xffeba86d3912b6084212ab6080a390822af00949";
+  const token0 = "0x1111111111111111111111111111111111111111";
+  const token1 = "0x2222222222222222222222222222222222222222";
+  const chainKeys = [
+    "ethereum", "bnb", "base", "arbitrum", "polygon", "avalanche", "optimism", "robinhood",
+  ];
+  const rpcByChain = Object.fromEntries(
+    chainKeys.map((key) => [key, [`https://${key}.example`]]),
+  );
+  const state = {
+    pool,
+    token0,
+    token1,
+    token0Symbol: "SEASON",
+    token1Symbol: "WETH",
+    decimals0: 18,
+    decimals1: 18,
+    fee: 3000,
+    tickSpacing: 60,
+    price: 1.5,
+    liquidity: "123456789",
+    sqrtPriceX96: "1",
+    tick: 0,
+  };
+  const clients = Object.fromEntries(chainKeys.map((key) => [
+    key,
+    {
+      provider: {
+        getCode: async () => "0x",
+        call: async () => "0x",
+      },
+      getPoolState: async (address) => {
+        if (key !== "robinhood" || String(address).toLowerCase() !== pool) {
+          throw new Error(`not a pool on ${key}`);
+        }
+        return state;
+      },
+    },
+  ]));
+  const fetchImpl = async (url) => {
+    if (url.includes("goplus")) return response({ result: {} });
+    if (url.includes("geckoterminal")) return response({ data: [] });
+    return response({ pairs: [] });
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: pool,
+    config: {
+      chain: "robinhood",
+      rpcByChain,
+      indexer: { enabled: false },
+    },
+    router: { get: (key) => clients[key] || null },
+    fetchImpl,
+    timeoutMs: 1_000,
+    enableRpcFallback: true,
+  });
+
+  assert.equal(analysis.error, undefined);
+  assert.equal(analysis.addressType, "pool");
+  assert.equal(analysis.chain, "robinhood");
+  assert.equal(analysis.chainId, 4663);
+  assert.equal(analysis.primary.pool, pool);
+  assert.equal(analysis.primary.feeTier, 3000);
+  assert.equal(analysis.primary.feePercent, 0.3);
+  assert.equal(analysis.primary.tickSpacing, 60);
+  assert.equal(analysis.primary.priceNative, 1.5);
+  assert.equal(analysis.primary.liquidity, "123456789");
+
+  const text = formatPoolAnalysis(analysis);
+  assert.match(text, /Type: <b>POOL<\/b>/);
+  assert.match(text, /fee 0\.3%/);
+  assert.match(text, /tick 60/);
+  assert.match(text, /On-chain liquidity 123456789/);
+  assert.match(text, /price \$1\.5 WETH\/SEASON/);
+});
+
+test("token screening enriches every pool with feeTier and tickSpacing before formatting", async () => {
+  const token = "0x3333333333333333333333333333333333333333";
+  const quote = "0x4444444444444444444444444444444444444444";
+  const poolA = "0x5555555555555555555555555555555555555555";
+  const poolB = "0x6666666666666666666666666666666666666666";
+  const rpcCalls = [];
+  const fees = new Map([
+    [poolA.toLowerCase(), { fee: 500, tickSpacing: 10 }],
+    [poolB.toLowerCase(), { fee: 10000, tickSpacing: 200 }],
+  ]);
+
+  const fetchImpl = async (url) => {
+    if (url.includes("dexscreener") && url.includes("/tokens/")) {
+      return response({
+        pairs: [
+          dexPair({
+            pairAddress: poolA,
+            feeTier: null,
+            fee: null,
+            liquidity: { usd: 900_000 },
+            baseToken: { address: token, name: "Morpheus", symbol: "MORPH" },
+            quoteToken: { address: quote, name: "USD Coin", symbol: "USDC" },
+          }),
+          dexPair({
+            pairAddress: poolB,
+            feeTier: null,
+            fee: null,
+            liquidity: { usd: 500_000 },
+            baseToken: { address: token, name: "Morpheus", symbol: "MORPH" },
+            quoteToken: { address: quote, name: "USD Coin", symbol: "USDC" },
+          }),
+        ],
+      });
+    }
+    if (url.includes("goplus")) return response({ result: {} });
+    return response({ pairs: [] });
+  };
+  const client = {
+    getPoolState: async (pool) => {
+      rpcCalls.push(pool.toLowerCase());
+      const fee = fees.get(pool.toLowerCase());
+      if (!fee) throw new Error("unknown pool");
+      return fee;
+    },
+  };
+
+  const analysis = await analyzePoolAddress({
+    address: token,
+    config: {
+      chain: "base",
+      rpcByChain: { base: ["https://base.example"] },
+      indexer: { enabled: false },
+    },
+    router: { get: () => client },
+    fetchImpl,
+    timeoutMs: 1_000,
+    enableRpcFallback: true,
+  });
+
+  assert.equal(analysis.addressType, "token");
+  assert.equal(analysis.pools.length, 2);
+  const byPool = new Map(analysis.pools.map((entry) => [entry.pool.toLowerCase(), entry]));
+  assert.equal(byPool.get(poolA.toLowerCase()).feeTier, 500);
+  assert.equal(byPool.get(poolA.toLowerCase()).feePercent, 0.05);
+  assert.equal(byPool.get(poolA.toLowerCase()).tickSpacing, 10);
+  assert.equal(byPool.get(poolB.toLowerCase()).feeTier, 10000);
+  assert.equal(byPool.get(poolB.toLowerCase()).feePercent, 1);
+  assert.equal(byPool.get(poolB.toLowerCase()).tickSpacing, 200);
+  assert.ok(rpcCalls.includes(poolA.toLowerCase()));
+  assert.ok(rpcCalls.includes(poolB.toLowerCase()));
+
+  const text = formatPoolAnalysis(analysis);
+  assert.match(text, /fee 0\.05%/);
+  assert.match(text, /fee 1\.0%/);
 });
 
 test("falls back to on-chain fee() when the indexer has no pool", async () => {
